@@ -1,0 +1,42 @@
+// +build !mock
+
+#ifndef GOLINKER_HOTPATH_H
+#define GOLINKER_HOTPATH_H
+
+#include <stdint.h>
+#include <infiniband/verbs.h>
+#include <rdma/rdma_cma.h>
+
+// repost_item_t: batch re-post of receive buffers
+typedef struct {
+    struct ibv_qp *qp;
+    void *buf;
+    uint32_t size;
+    struct ibv_mr *mr;
+} repost_item_t;
+
+// send_item_t: batch post send
+typedef struct {
+    struct ibv_qp *qp;
+    void *buf;
+    uint32_t size;
+    struct ibv_mr *mr;
+    int flags;
+    uint64_t wr_id;
+} send_item_t;
+
+// Poll CQ for completions AND re-post previous batch receive buffers in one CGo call.
+// Returns number of completions (>=0), or negative errno on failure.
+int golinker_poll_and_repost(struct ibv_cq *cq, struct ibv_wc *wcs, int max_wcs,
+                          repost_item_t *reposts, int repost_count);
+
+// Post multiple sends chaining them via ibv_send_wr linked list for ONE ibv_post_send call.
+// Returns 0 on success, errno on failure.
+int golinker_batch_post_send(send_item_t *items, int count);
+
+// Post a single send work request.
+// Returns 0 on success, errno on failure.
+int golinker_post_send_single(struct ibv_qp *qp, void *buf, uint32_t size,
+                           struct ibv_mr *mr, uint64_t wr_id, int flags);
+
+#endif // GOLINKER_HOTPATH_H

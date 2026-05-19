@@ -1,0 +1,23 @@
+# IDE
+.idea/
+
+# Build
+bin/
+*.exe
+*.test
+
+# Orchestration artifacts (local only)
+.workflow/
+.github/agents/
+docs/domain/inbox/
+docs/domain/outbox/
+docs/domain/epics/
+docs/system/inbox/
+docs/system/outbox/
+docs/system/epics/
+docs/templates/
+railyard/
+
+# OS
+.DS_Store
+Thumbs.db
