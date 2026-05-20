@@ -1078,6 +1078,165 @@ The `initVerbs()` function selects the appropriate implementation at compile tim
 
 ---
 
+## 8.5. CM-Based RDMA Connection Setup
+
+This section documents the Connection Manager (CM) based RDMA connection
+establishment used by `golinker-bench` for real two-node benchmarks.
+
+### Architecture
+
+CM-based connections use the `rdma_cm` library to manage the full RDMA
+connection lifecycle. Three key interfaces bridge the Go layer and the
+underlying C rdma_cm calls:
+
+| Interface | Role | Implementation |
+|-----------|------|----------------|
+| `api.CMEventChannel` | Listens for CM events (connect requests, established, disconnected) | `RealCMEventChannel` (real) / `MockCMEventChannel` (mock) |
+| `api.CMAcceptor` | Accepts incoming connections: creates QP, calls `rdma_accept` | `RealCMEventChannel` (implements both) / `MockCMAcceptor` |
+| `api.CMDialer` | Client-side dial: resolve addr/route, create QP, connect | `RealCMDialer` / `MockCMDialer` |
+
+### Server Connection Flow
+
+```
+Client                          Server (RealCMEventChannel)
+  │                                │
+  │  rdma_connect()                │ rdma_listen() on addr:port
+  │ ─────────────────────────────► │
+  │                                │ GetEvent() → CONNECT_REQUEST
+  │                                │   event.ID = incoming CM ID
+  │                                │
+  │                                │ CMAcceptor.AcceptConn():
+  │                                │   1. rdma_create_qp(cmID, PD, sendCQ, recvCQ)
+  │                                │   2. rdma_accept(cmID)
+  │                                │   3. return RealQP
+  │                                │
+  │  ◄──── ESTABLISHED ──────────► │ GetEvent() → ESTABLISHED
+  │                                │   conn.SetState(StateConnected)
+  │                                │
+  │        data exchange           │
+  │  ◄═══════════════════════════► │
+  │                                │
+  │  rdma_disconnect()             │ GetEvent() → DISCONNECTED
+  │ ─────────────────────────────► │   conn.Close()
+```
+
+### Client Connection Flow (RealCMDialer.Dial)
+
+The `Dial()` method performs a complete 10-step handshake, blocking until
+the connection is established or an error occurs:
+
+```
+Step 1:  rdma_create_event_channel()     — per-connection event channel
+Step 2:  rdma_create_id(ch)              — allocate CM ID
+Step 3:  rdma_resolve_addr(id, addr, port, 2000ms)
+Step 4:  rdma_get_cm_event() → ADDR_RESOLVED
+Step 5:  rdma_resolve_route(id, 2000ms)
+Step 6:  rdma_get_cm_event() → ROUTE_RESOLVED
+Step 7:  rdma_create_qp(id, PD, sendCQ, recvCQ, cfg)
+Step 8:  rdma_connect(id)
+Step 9:  rdma_get_cm_event() → ESTABLISHED
+Step 10: return (QP, cmID)
+```
+
+On error at any step, previously allocated resources are cleaned up before
+returning. The returned `cmID` (`unsafe.Pointer`) is stored in `ConnDeps`
+for later disconnect.
+
+### Connection State Machine with CM Events
+
+```
+                    ┌──────────┐
+                    │ StateInit │
+                    └─────┬────┘
+                          │ CONNECT_REQUEST (server) or Dial() (client)
+                    ┌─────▼──────────┐
+                    │ StateConnecting │
+                    └─────┬──────────┘
+                          │ ESTABLISHED
+                    ┌─────▼──────────┐
+                    │ StateConnected  │ ← data exchange happens here
+                    └─────┬──────────┘
+                          │ DISCONNECTED or Close()
+                    ┌─────▼──────────┐
+                    │ StateDraining   │ → Dialer.Disconnect(cmID)
+                    └─────┬──────────┘
+                          │
+                    ┌─────▼──────────┐
+                    │ StateClosed     │
+                    └────────────────┘
+
+                    ┌────────────────┐
+                    │ StateError      │ ← REJECTED event
+                    └────────────────┘
+```
+
+### Disconnect and Cleanup
+
+When `conn.Close()` is called:
+
+1. If `Dialer` and `CMID` are both non-nil, call `Dialer.Disconnect(cmID)`
+   (best-effort `rdma_disconnect`)
+2. Transition to `StateDraining`
+3. Close the done channel to unblock pending `Recv()` calls
+4. Transition to `StateClosed`
+
+The server side detects disconnection via the CM event loop
+(`DISCONNECTED` event) and cleans up the corresponding connection.
+
+### Connection Manager CM Wiring
+
+The `connection.Manager` integrates CM via its config:
+
+```go
+connection.ManagerConfig{
+    CMChannel:  cmChannel,   // server: event channel for incoming connections
+    CMAcceptor: cmAcceptor,  // server: accepts connections, creates QPs
+    CMDialer:   cmDialer,    // client: dials outbound connections
+    PD:         pd,          // protection domain for QP creation
+    SendCQ:     sendCQ,      // shared send completion queue
+    RecvCQ:     recvCQ,      // shared recv completion queue
+    QPConfig:   api.QueuePairConfig{...}, // QP sizing
+}
+```
+
+- **Server path**: `RunCMEventLoop(ctx)` goroutine processes events;
+  `handleConnectRequest` calls `CMAcceptor.AcceptConn()` and delivers
+  the connection via the accept channel.
+- **Client path**: `Connect(ctx, "host:port")` calls `CMDialer.Dial()`
+  which blocks until `ESTABLISHED`, then returns a ready-to-use connection.
+- **Lookup**: `cmIDConns` (`sync.Map`) provides O(1) lookup from CM ID to
+  connection for established/disconnected/rejected events. Falls back to
+  legacy scan for mock mode.
+
+### Configuration
+
+The `--device` flag specifies an IB device name (e.g., `mlx5_0`), **not** an
+IP address. Use `ibv_devices` to list available devices:
+
+```bash
+# List RDMA devices
+ibv_devices
+
+# Start server on specific device
+golinker-bench server --addr 0.0.0.0:8629 --device mlx5_0
+
+# Client connects to server IP (resolved via rdma_resolve_addr)
+golinker-bench client latency --addr 10.0.0.1:8629 --device mlx5_0
+```
+
+### Build Tags
+
+| Tag | Transport | Use Case |
+|-----|-----------|----------|
+| (none) | Real RDMA | Production benchmarks on RDMA hardware |
+| `mock` | Mock verbs + mock CM | Development, CI, unit tests |
+
+Mock mode uses `MockCMEventChannel`, `MockCMAcceptor`, and `MockCMDialer`
+which provide in-memory fakes that satisfy the interfaces without requiring
+RDMA hardware.
+
+---
+
 ## 9. Implementation Plan
 
 ### Phase 1: Foundation [DONE]
@@ -1099,14 +1258,18 @@ The `initVerbs()` function selects the appropriate implementation at compile tim
 
 **Goal**: Wire server and client modes to golinker core for real two-node benchmarks.
 
-- [ ] Server transport: initialize RDMA stack (verbs, PD, buffer pools, CQ pool, connection manager)
-- [ ] Echo handler: receive message, send back immediately
-- [ ] Sink handler: receive message, send minimal ACK
-- [ ] Client transport: establish RDMA connections to remote server
+- [x] Server transport: initialize RDMA stack (verbs, PD, buffer pools, CQ pool, connection manager)
+- [x] Echo handler: receive message, send back immediately
+- [x] Sink handler: receive message, send minimal ACK
+- [x] Client transport: establish RDMA connections to remote server
+- [x] New transport CLI flags (--device, --queue-depth, --numa-node)
+- [x] RealVerbs adapter (libibverbs CGo bindings)
+- [x] CM-based connection setup (RealCMEventChannel, RealCMDialer, CMAcceptor)
+- [x] Server CM event loop wiring (RunCMEventLoop, initCMListener)
+- [x] Client CM dialer wiring (initCMDialer, ManagerConfig.CMDialer)
+- [x] RDMA hardware counter collection (sysfs reader)
 - [ ] `bench_latency` scenario: closed-loop RTT measurement via echo mode
 - [ ] `bench_throughput` scenario: open-loop max msg/sec via sink mode
-- [ ] New transport CLI flags (--device, --queue-depth, --numa-node)
-- [ ] RDMA hardware counter collection (sysfs reader)
 - [ ] Integration test: server + client on same host via SoftRoCE (rxe)
 
 **Deliverable**: `golinker-bench server` on Node A + `golinker-bench client latency` on Node B produces real RDMA latency/throughput/TPS metrics.

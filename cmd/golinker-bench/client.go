@@ -198,23 +198,50 @@ func (c *BenchClient) runEndToEnd(scenario string) error {
 	if err != nil {
 		return fmt.Errorf("creating send buffer pool: %w", err)
 	}
-	_ = sendPool
+	defer sendPool.Close()
 
 	recvPool, err := newBufferPool(verbs, pd, bufferSize, 128, numaNode)
 	if err != nil {
 		return fmt.Errorf("creating recv buffer pool: %w", err)
 	}
-	_ = recvPool
+	defer recvPool.Close()
 
 	cqPool, err := newCQPool(verbs, cqNumber, pollMode)
 	if err != nil {
 		return fmt.Errorf("creating CQ pool: %w", err)
 	}
-	_ = cqPool
+	defer cqPool.Close()
 
-	// Create connection manager and establish connections
+	// Initialize CM dialer for real RDMA connections
+	cmDialer, err := initCMDialer()
+	if err != nil {
+		return fmt.Errorf("initializing CM dialer: %w", err)
+	}
+	defer cmDialer.Close()
+
+	// Assign send and recv CQs from the pool for QP creation
+	_, sendCQ, err := cqPool.Assign()
+	if err != nil {
+		return fmt.Errorf("assigning send CQ: %w", err)
+	}
+	_, recvCQ, err := cqPool.Assign()
+	if err != nil {
+		return fmt.Errorf("assigning recv CQ: %w", err)
+	}
+
+	// Create connection manager with CM dialer for outbound connections
 	connMgr := connection.NewManager(connection.ManagerConfig{
-		Verbs:      verbs,
+		Verbs:    verbs,
+		CMDialer: cmDialer,
+		PD:       pd,
+		SendCQ:   sendCQ,
+		RecvCQ:   recvCQ,
+		QPConfig: api.QueuePairConfig{
+			MaxSendWR:  queueDepth,
+			MaxRecvWR:  queueDepth,
+			MaxSendSGE: 1,
+			MaxRecvSGE: 1,
+		},
 		QueueDepth: queueDepth,
 	})
 

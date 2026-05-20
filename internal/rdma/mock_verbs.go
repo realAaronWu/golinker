@@ -13,6 +13,12 @@ import (
 // qpCounter is a package-level counter for QP number assignment.
 var qpCounter uint32
 
+// Compile-time interface checks.
+var (
+	_ api.CMAcceptor = (*MockCMAcceptor)(nil)
+	_ api.CMDialer   = (*MockCMDialer)(nil)
+)
+
 // --- MockPD ---
 
 // MockPD implements api.ProtectionDomain.
@@ -184,4 +190,42 @@ func (ch *MockCMEventChannel) Close() error {
 // InjectEvent sends an event into the channel for testing.
 func (ch *MockCMEventChannel) InjectEvent(evt *api.CMEvent) {
 	ch.events <- evt
+}
+
+// --- MockCMAcceptor ---
+
+// MockCMAcceptor implements api.CMAcceptor with in-memory fakes.
+type MockCMAcceptor struct{}
+
+// NewMockCMAcceptor creates a new MockCMAcceptor.
+func NewMockCMAcceptor() *MockCMAcceptor {
+	return &MockCMAcceptor{}
+}
+
+func (a *MockCMAcceptor) AcceptConn(cmID unsafe.Pointer, pd api.ProtectionDomain, sendCQ, recvCQ api.CompletionQueue, cfg api.QueuePairConfig) (api.QueuePair, error) {
+	num := atomic.AddUint32(&qpCounter, 1)
+	return &MockQP{qpNum: num, state: api.QPStateRTS}, nil
+}
+
+// --- MockCMDialer ---
+
+// MockCMDialer implements api.CMDialer with in-memory fakes.
+type MockCMDialer struct{}
+
+// NewMockCMDialer creates a new MockCMDialer.
+func NewMockCMDialer() *MockCMDialer {
+	return &MockCMDialer{}
+}
+
+func (d *MockCMDialer) Dial(ctx context.Context, addr string, port int, pd api.ProtectionDomain, sendCQ, recvCQ api.CompletionQueue, cfg api.QueuePairConfig) (api.QueuePair, unsafe.Pointer, error) {
+	num := atomic.AddUint32(&qpCounter, 1)
+	return &MockQP{qpNum: num, state: api.QPStateRTS}, nil, nil
+}
+
+func (d *MockCMDialer) Disconnect(cmID unsafe.Pointer) error {
+	return nil
+}
+
+func (d *MockCMDialer) Close() error {
+	return nil
 }

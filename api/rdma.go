@@ -113,8 +113,25 @@ type SGE struct {
 // CMEvent represents a connection manager event.
 type CMEvent struct {
 	Type        CMEventType
-	ID          unsafe.Pointer
+	ID          unsafe.Pointer // rdma_cm_id for this event
 	PrivateData []byte
+	Opaque      unsafe.Pointer // implementation-specific (e.g., raw C event for deferred ack)
+}
+
+// CMAcceptor handles server-side RDMA connection acceptance.
+// On a CONNECT_REQUEST event the acceptor creates a QP on the incoming CM ID,
+// calls rdma_accept, and returns the ready QueuePair.
+type CMAcceptor interface {
+	AcceptConn(cmID unsafe.Pointer, pd ProtectionDomain, sendCQ, recvCQ CompletionQueue, cfg QueuePairConfig) (QueuePair, error)
+}
+
+// CMDialer handles client-side RDMA connection establishment.
+// It performs the full resolve-addr → resolve-route → create-QP → connect
+// handshake and blocks until the connection is ESTABLISHED.
+type CMDialer interface {
+	Dial(ctx context.Context, addr string, port int, pd ProtectionDomain, sendCQ, recvCQ CompletionQueue, cfg QueuePairConfig) (QueuePair, unsafe.Pointer, error)
+	Disconnect(cmID unsafe.Pointer) error
+	Close() error
 }
 
 // CMEventType identifies the type of CM event.

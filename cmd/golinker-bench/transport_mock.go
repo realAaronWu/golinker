@@ -15,3 +15,12 @@ func initVerbs(deviceName string) (api.Verbs, api.ProtectionDomain, error) {
 	}
 	return v, pd, nil
 }
+
+func initCMListener(addr string, port int) (api.CMEventChannel, api.CMAcceptor, error) {
+	ch := rdma.NewMockCMEventChannel(64)
+	return ch, rdma.NewMockCMAcceptor(), nil
+}
+
+func initCMDialer() (api.CMDialer, error) {
+	return rdma.NewMockCMDialer(), nil
+}

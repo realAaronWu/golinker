@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/wua20/golinker/api"
 )
@@ -22,6 +23,8 @@ type ConnDeps struct {
 	QP       api.QueuePair
 	SendPool api.SendBufferPool
 	RecvPool api.RecvBufferPool
+	CMID     unsafe.Pointer // rdma_cm_id for this connection
+	Dialer   api.CMDialer   // for disconnect on close (may be nil)
 }
 
 // Conn implements api.Connection for a single RDMA connection.
@@ -113,6 +116,11 @@ func (c *Conn) Close() error {
 	currentState := c.State()
 	if currentState == api.StateClosed || currentState == api.StateDraining {
 		return nil
+	}
+
+	// Best-effort CM disconnect before draining
+	if c.deps.Dialer != nil && c.deps.CMID != nil {
+		_ = c.deps.Dialer.Disconnect(c.deps.CMID)
 	}
 
 	// Transition to Draining

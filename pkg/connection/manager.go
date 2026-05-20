@@ -3,6 +3,9 @@ package connection
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -23,12 +26,19 @@ type ManagerConfig struct {
 	RecvPool   api.RecvBufferPool
 	CQPoller   api.CQPoller
 	QueueDepth int
+	PD         api.ProtectionDomain
+	SendCQ     api.CompletionQueue
+	RecvCQ     api.CompletionQueue
+	QPConfig   api.QueuePairConfig
+	CMAcceptor api.CMAcceptor
+	CMDialer   api.CMDialer
 }
 
 // Manager implements api.ConnectionManager.
 type Manager struct {
 	cfg         ManagerConfig
 	connections sync.Map // map[uint64]*Conn
+	cmIDConns   sync.Map // maps unsafe.Pointer (CM ID) -> *Conn
 	nextID      atomic.Uint64
 	acceptCh    chan *Conn
 	closed      atomic.Bool
@@ -71,23 +81,45 @@ func (m *Manager) Connect(ctx context.Context, addr string) (api.Connection, err
 	}
 
 	id := m.nextID.Add(1)
+
 	deps := ConnDeps{
 		Verbs:    m.cfg.Verbs,
-		QP:       nil, // QP will be created by CM event handling in real implementation
 		SendPool: m.cfg.SendPool,
 		RecvPool: m.cfg.RecvPool,
 	}
 
+	// If CMDialer is available, do real CM-based connection
+	if m.cfg.CMDialer != nil {
+		// Parse addr to extract host and port
+		host, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port %q: %w", portStr, err)
+		}
+
+		qp, cmID, err := m.cfg.CMDialer.Dial(ctx, host, port, m.cfg.PD, m.cfg.SendCQ, m.cfg.RecvCQ, m.cfg.QPConfig)
+		if err != nil {
+			return nil, fmt.Errorf("CM dial to %s: %w", addr, err)
+		}
+
+		deps.QP = qp
+		deps.CMID = cmID
+		deps.Dialer = m.cfg.CMDialer
+
+		conn := NewConn(id, addr, deps)
+		conn.SetState(api.StateConnected) // CM dial blocks until ESTABLISHED
+		m.connections.Store(id, conn)
+		m.cmIDConns.Store(cmID, conn)
+		return conn, nil
+	}
+
+	// Fall back to mock behavior (no real CM)
 	conn := NewConn(id, addr, deps)
 	conn.SetState(api.StateConnecting)
-
-	// In a real implementation, we would:
-	// 1. Resolve the address via CM
-	// 2. Wait for route resolution
-	// 3. Create QP and connect
-	// For mock/test purposes, transition directly to Connected
 	conn.SetState(api.StateConnected)
-
 	m.connections.Store(id, conn)
 	return conn, nil
 }

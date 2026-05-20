@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime/pprof"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -148,9 +150,47 @@ func executeServer(cmd *cobra.Command, args []string) error {
 	server.cqPool = cqp
 	defer cqp.Close()
 
-	// Create connection manager
+	// Parse addr into host and port for CM listener
+	host, portStr, err := net.SplitHostPort(server.addr)
+	if err != nil {
+		return fmt.Errorf("parsing addr %q: %w", server.addr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("invalid port %q: %w", portStr, err)
+	}
+
+	// Initialize CM listener (event channel + acceptor)
+	cmChannel, cmAcceptor, err := initCMListener(host, port)
+	if err != nil {
+		return fmt.Errorf("initializing CM listener: %w", err)
+	}
+	defer cmChannel.Close()
+
+	// Assign send and recv CQs from the pool for QP creation
+	_, sendCQ, err := cqp.Assign()
+	if err != nil {
+		return fmt.Errorf("assigning send CQ: %w", err)
+	}
+	_, recvCQ, err := cqp.Assign()
+	if err != nil {
+		return fmt.Errorf("assigning recv CQ: %w", err)
+	}
+
+	// Create connection manager with CM wiring
 	connMgr := connection.NewManager(connection.ManagerConfig{
 		Verbs:      verbs,
+		CMChannel:  cmChannel,
+		CMAcceptor: cmAcceptor,
+		PD:         pd,
+		SendCQ:     sendCQ,
+		RecvCQ:     recvCQ,
+		QPConfig: api.QueuePairConfig{
+			MaxSendWR:  queueDepth,
+			MaxRecvWR:  queueDepth,
+			MaxSendSGE: 1,
+			MaxRecvSGE: 1,
+		},
 		SendPool:   nil, // buffer.Pool does not implement api.SendBufferPool yet
 		RecvPool:   nil, // buffer.Pool does not implement api.RecvBufferPool yet
 		QueueDepth: queueDepth,
@@ -182,6 +222,9 @@ func executeServer(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Start CM event loop to accept incoming connections
+	go connMgr.RunCMEventLoop(ctx)
+
 	if err := srv.Start(ctx); err != nil {
 		return fmt.Errorf("starting server: %w", err)
 	}
@@ -192,6 +235,7 @@ func executeServer(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("golinker-bench server starting\n")
 	fmt.Printf("  Address: %s\n", server.addr)
+	fmt.Printf("  CM listening: %s:%d\n", host, port)
 	fmt.Printf("  Mode: %s\n", server.mode)
 	fmt.Printf("  Buffer size: %d\n", bufferSize)
 	fmt.Printf("  Queue depth: %d\n", queueDepth)
