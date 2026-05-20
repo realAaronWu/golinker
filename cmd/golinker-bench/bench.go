@@ -30,8 +30,8 @@ type BenchConfig struct {
 
 	// Output
 	OutputFormat string // "text", "json", "csv"
-	OutputFile  string
-	Verbose     bool
+	OutputFile   string
+	Verbose      bool
 
 	// Profiling
 	Pprof      bool
@@ -39,30 +39,39 @@ type BenchConfig struct {
 	MemProfile string
 }
 
+// RDMACounterResult holds RDMA hardware counter deltas for a benchmark run.
+type RDMACounterResult struct {
+	TXPackets uint64 `json:"tx_packets"`
+	RXPackets uint64 `json:"rx_packets"`
+	TXBytes   uint64 `json:"tx_bytes"`
+	RXBytes   uint64 `json:"rx_bytes"`
+}
+
 // BenchResult holds the output of a benchmark run.
 type BenchResult struct {
-	Metadata   ResultMetadata   `json:"metadata"`
-	Latency    LatencyResult    `json:"latency"`
-	Throughput ThroughputResult `json:"throughput"`
-	Resources  ResourceResult   `json:"resources"`
-	Errors     ErrorResult      `json:"errors"`
+	Metadata     ResultMetadata    `json:"metadata"`
+	Latency      LatencyResult     `json:"latency"`
+	Throughput   ThroughputResult  `json:"throughput"`
+	Resources    ResourceResult    `json:"resources"`
+	RDMACounters RDMACounterResult `json:"rdma_counters"`
+	Errors       ErrorResult       `json:"errors"`
 }
 
 type ResultMetadata struct {
-	ToolVersion  string    `json:"tool_version"`
-	Timestamp    time.Time `json:"timestamp"`
-	Scenario     string    `json:"scenario"`
-	DurationSec  float64   `json:"duration_sec"`
-	WarmupSec    float64   `json:"warmup_sec"`
-	MessageSize  int       `json:"message_size"`
-	Connections  int       `json:"connections"`
-	CQNumber     int       `json:"cq_number"`
-	PollMode     string    `json:"poll_mode"`
-	GolinkerVersion string `json:"golinker_version"`
-	GoVersion    string    `json:"go_version"`
-	Hostname     string    `json:"hostname"`
-	OS           string    `json:"os"`
-	Arch         string    `json:"arch"`
+	ToolVersion     string    `json:"tool_version"`
+	Timestamp       time.Time `json:"timestamp"`
+	Scenario        string    `json:"scenario"`
+	DurationSec     float64   `json:"duration_sec"`
+	WarmupSec       float64   `json:"warmup_sec"`
+	MessageSize     int       `json:"message_size"`
+	Connections     int       `json:"connections"`
+	CQNumber        int       `json:"cq_number"`
+	PollMode        string    `json:"poll_mode"`
+	GolinkerVersion string    `json:"golinker_version"`
+	GoVersion       string    `json:"go_version"`
+	Hostname        string    `json:"hostname"`
+	OS              string    `json:"os"`
+	Arch            string    `json:"arch"`
 }
 
 type LatencyResult struct {

@@ -813,70 +813,328 @@ python scripts/bench_history.py --metric latency_p99 --last 100 --output trend.p
 
 ---
 
-## 8. Implementation Plan
+## 8. End-to-End RDMA Transport Integration
 
-### Phase 1: Foundation (Week 1-2)
+### Overview
 
-**Goal**: Basic latency and throughput benchmarks with HDR histograms.
+This section describes the transport integration that wires the benchmark tool's
+server and client modes to the golinker core library, enabling real two-node RDMA
+benchmarks. The existing micro-benchmarks (buffer-pool, cq-poll, aggregation,
+channel-vs-mutex) remain in-process; the end-to-end scenarios (`latency`,
+`throughput`, `bandwidth`, `mixed`) now use real RDMA connections via the
+`pkg/server`, `pkg/connection`, and `pkg/message` packages.
 
-- [ ] Project structure: `cmd/golinker-bench/main.go`, CLI parsing with `cobra`
-- [ ] HDR histogram integration (`hdrhistogram-go`)
-- [ ] Server mode: echo responder
-- [ ] Client mode: closed-loop latency measurement
-- [ ] Open-loop client with coordinated omission correction
-- [ ] Text and JSON output formatters
-- [ ] `bench_latency` scenario (64B, 256B, 1KB, 4KB, 12KB)
-- [ ] `bench_throughput` scenario (sink mode, max rate)
-- [ ] Basic resource tracking (CPU via `/proc/stat`, RSS via `/proc/self/status`)
+### Architecture: Two-Node RDMA Benchmark
 
-**Deliverable**: Can run `golinker-bench server` and `golinker-bench client latency` and get meaningful results.
+```
+Node A (Server)                         Node B (Client)
+┌───────────────────────┐               ┌───────────────────────┐
+│  golinker-bench server│               │  golinker-bench client│
+│                       │               │                       │
+│  ┌─────────────────┐  │   RDMA RC     │  ┌─────────────────┐  │
+│  │ pkg/server      │◄─┼───────────────┼──│ pkg/connection   │  │
+│  │  .Start()       │  │   QP(s)       │  │  .Connect()      │  │
+│  │  .RegisterHandler│ │               │  │  .Send() / .Recv()│ │
+│  └────────┬────────┘  │               │  └────────┬────────┘  │
+│           │           │               │           │           │
+│  ┌────────▼────────┐  │               │  ┌────────▼────────┐  │
+│  │ Echo / Sink     │  │               │  │ Load Generator   │  │
+│  │ MessageHandler  │  │               │  │ + HDR Histogram  │  │
+│  └─────────────────┘  │               │  └─────────────────┘  │
+│                       │               │                       │
+│  pkg/buffer (pools)   │               │  pkg/buffer (pools)   │
+│  pkg/cq    (pollers)  │               │  pkg/cq    (pollers)  │
+│  pkg/config           │               │  pkg/config           │
+└───────────────────────┘               └───────────────────────┘
+```
 
-### Phase 2: Micro-benchmarks (Week 3-4)
+### Server Transport Integration
 
-**Goal**: Isolate each subsystem's performance characteristics.
+The benchmark server creates a full golinker server stack:
 
-- [ ] `bench_cgo_overhead` — empty call, single verb, batch verbs
-- [ ] `bench_buffer_pool` — multi-goroutine alloc/free contention test
-- [ ] `bench_cq_poll` — raw poll throughput at various batch sizes
-- [ ] `bench_aggregation` — serialization + copy overhead
-- [ ] `bench_mr_reg` — registration/deregistration timing
-- [ ] `bench_channel_vs_mutex` — pool implementation comparison
-- [ ] `bench_bandwidth` — large message throughput (RDMA read path)
+```go
+// cmd/golinker-bench/server.go (transport integration)
+func (s *BenchServer) startRDMA(ctx context.Context) error {
+    cfg := config.DefaultConfig()
+    cfg.Endpoint = s.addr
+    cfg.CQNumber = s.cqNumber
+    cfg.PollMode = parsePollMode(s.pollMode)
+    cfg.BufferSize = s.bufferSize
+    cfg.EnableAggregate = true
+
+    // Initialize RDMA verbs (real or mock based on build tag)
+    verbs, pd := initVerbs(cfg)
+
+    // Create buffer pools
+    sendPool := buffer.NewPool(verbs, pd, sendPoolConfig(cfg))
+    recvPool := buffer.NewPool(verbs, pd, recvPoolConfig(cfg))
+
+    // Create CQ pool and connection manager
+    cqPool := cq.NewPool(verbs, cfg.CQNumber, pollerConfig(cfg))
+    connMgr := connection.NewManager(managerConfig(verbs, sendPool, recvPool, cqPool))
+
+    // Create and start server
+    srv := server.NewServer(cfg, serverDeps(verbs, connMgr, cqPool, sendPool, recvPool))
+    srv.RegisterHandler(s.newHandler())  // echo or sink
+    return srv.Start(ctx)
+}
+```
+
+**Echo Handler** — receives a message, sends it back (for latency measurement):
+
+```go
+type EchoHandler struct{ stats *AtomicStats }
+
+func (h *EchoHandler) Handle(conn api.Connection, msg *api.Message) (*api.Message, error) {
+    h.stats.MessagesReceived.Add(1)
+    h.stats.BytesReceived.Add(int64(msg.Length))
+    h.stats.MessagesSent.Add(1)
+    h.stats.BytesSent.Add(int64(msg.Length))
+    return msg, nil  // echo back same message
+}
+```
+
+**Sink Handler** — receives messages, sends minimal ACK (for throughput measurement):
+
+```go
+type SinkHandler struct{ stats *AtomicStats; ackBuf []byte }
+
+func (h *SinkHandler) Handle(conn api.Connection, msg *api.Message) (*api.Message, error) {
+    h.stats.MessagesReceived.Add(1)
+    h.stats.BytesReceived.Add(int64(msg.Length))
+    h.stats.MessagesSent.Add(1)
+    return &api.Message{Buffer: h.ackBuf, Length: 4}, nil  // minimal ACK
+}
+```
+
+### Client Transport Integration
+
+The benchmark client establishes real RDMA connections and measures true RTT:
+
+```go
+// cmd/golinker-bench/client.go (transport integration)
+func (c *BenchClient) connectRDMA(ctx context.Context) ([]api.Connection, error) {
+    cfg := config.DefaultConfig()
+    cfg.CQNumber = c.config.CQNumber
+    cfg.PollMode = parsePollMode(c.config.PollMode)
+    cfg.BufferSize = c.config.BufferSize
+
+    verbs, pd := initVerbs(cfg)
+    sendPool := buffer.NewPool(verbs, pd, sendPoolConfig(cfg))
+    recvPool := buffer.NewPool(verbs, pd, recvPoolConfig(cfg))
+    cqPool := cq.NewPool(verbs, cfg.CQNumber, pollerConfig(cfg))
+    connMgr := connection.NewManager(managerConfig(verbs, sendPool, recvPool, cqPool))
+
+    conns := make([]api.Connection, c.config.Connections)
+    for i := range conns {
+        conn, err := connMgr.Connect(ctx, c.config.Addr)
+        if err != nil { return nil, err }
+        conns[i] = conn
+    }
+    return conns, nil
+}
+```
+
+**Latency measurement (closed-loop, echo mode):**
+
+```go
+func (c *BenchClient) benchLatency(ctx context.Context, conn api.Connection) {
+    payload := make([]byte, c.config.MessageSize)
+    for {
+        select {
+        case <-ctx.Done(): return
+        default:
+        }
+        c.limiter.Wait()
+        start := time.Now()
+        conn.Send(&api.Message{Buffer: payload, Length: uint32(len(payload))})
+        _, err := conn.Recv(ctx)      // blocks until echo returns
+        if err != nil { c.errors.Add(1); continue }
+        latency := time.Since(start)
+        c.hist.Record(latency.Microseconds())
+        c.msgsSent.Add(1)
+        c.msgsRecv.Add(1)
+    }
+}
+```
+
+**Throughput measurement (open-loop, sink mode):**
+
+```go
+func (c *BenchClient) benchThroughput(ctx context.Context, conns []api.Connection) {
+    // Sender goroutines: round-robin across connections
+    for i := 0; i < c.config.Goroutines; i++ {
+        conn := conns[i % len(conns)]
+        go func() {
+            payload := make([]byte, c.config.MessageSize)
+            for {
+                select {
+                case <-ctx.Done(): return
+                default:
+                }
+                c.limiter.Wait()
+                start := time.Now()
+                conn.Send(&api.Message{Buffer: payload, Length: uint32(len(payload))})
+                c.msgsSent.Add(1)
+                latency := time.Since(start)
+                c.hist.Record(latency.Microseconds())
+            }
+        }()
+    }
+    // Receiver goroutines: drain ACKs
+    for _, conn := range conns {
+        go func(c api.Connection) {
+            for {
+                _, err := c.Recv(ctx)
+                if err != nil { return }
+                c.msgsRecv.Add(1)
+            }
+        }(conn)
+    }
+}
+```
+
+### New CLI Flags
+
+The following transport flags are added to both server and client:
+
+```
+Transport Flags:
+  --device string      RDMA device name (default: auto-detect first device)
+  --cq-number int      Number of completion queues (default 2)
+  --poll-mode string   CQ poll mode: busy, event, smart, user (default "busy")
+  --buffer-size int    Send/recv buffer size in bytes (default 12288)
+  --batch-size int     Max messages per aggregation batch (default 16)
+  --queue-depth int    QP send/recv queue depth, must be power of 2 (default 128)
+  --numa-node int      NUMA node for buffer allocation (default -1 = auto)
+```
+
+### RDMA Hardware Counter Collection
+
+Read hardware performance counters from sysfs at benchmark start and end:
+
+```go
+// cmd/golinker-bench/rdma_counters.go
+type RDMACounters struct {
+    TXPackets uint64
+    RXPackets uint64
+    TXBytes   uint64
+    RXBytes   uint64
+}
+
+func ReadCounters(device string, port int) (*RDMACounters, error) {
+    base := fmt.Sprintf("/sys/class/infiniband/%s/ports/%d/counters", device, port)
+    // Read port_xmit_data, port_rcv_data, port_xmit_packets, port_rcv_packets
+}
+```
+
+### Metrics Collected
+
+For each end-to-end benchmark run:
+
+| Metric Category | Metrics | Source |
+|----------------|---------|--------|
+| **Latency** | p50, p75, p90, p99, p99.9, p99.99, max, min, mean, stddev | HDR Histogram of actual RTT |
+| **Throughput (TPS)** | messages/sec (send and recv rates) | Atomic counters / elapsed time |
+| **Data Throughput** | MB/sec | messages/sec * message_size |
+| **Resource Usage** | CPU%, RSS MB, goroutines, GC pause p99 | /proc/self/stat, runtime.ReadMemStats |
+| **RDMA HW Counters** | TX/RX packets, TX/RX bytes | /sys/class/infiniband sysfs delta |
+| **Errors** | send errors, recv errors, timeouts, connection errors | Atomic error counters |
+
+### Two-Node Usage
+
+```bash
+# Node A: Start benchmark server in echo mode
+golinker-bench server --addr 0.0.0.0:8629 --mode echo \
+  --device mlx5_0 --poll-mode busy --cq-number 4
+
+# Node B: Run latency benchmark
+golinker-bench client latency --addr 10.0.0.1:8629 \
+  --device mlx5_0 --message-size 64 --duration 60s \
+  --output json --output-file latency_64B.json
+
+# Node B: Run throughput benchmark
+golinker-bench client throughput --addr 10.0.0.1:8629 \
+  --device mlx5_0 --message-size 64 --connections 8 \
+  --duration 60s --output json --output-file throughput_64B.json
+
+# Node B: Run bandwidth benchmark (large messages)
+golinker-bench client bandwidth --addr 10.0.0.1:8629 \
+  --device mlx5_0 --message-size 65536 --connections 4 \
+  --duration 60s --output json --output-file bandwidth_64KB.json
+
+# Local: Compare results against baseline
+golinker-bench report --compare baseline/latency_64B.json latency_64B.json
+```
+
+### Build Tags
+
+The transport integration supports two build modes:
+
+- **`go build ./...`** — Full build with real RDMA (requires libibverbs, librdmacm)
+- **`go build -tags mock ./...`** — Mock build for development/CI without RDMA hardware
+
+The `initVerbs()` function selects the appropriate implementation at compile time.
+
+---
+
+## 9. Implementation Plan
+
+### Phase 1: Foundation [DONE]
+
+**Goal**: CLI framework, HDR histograms, micro-benchmarks, reporting.
+
+- [x] Project structure: `cmd/golinker-bench/main.go`, CLI parsing with `cobra`
+- [x] HDR histogram integration (`hdrhistogram-go`)
+- [x] Text, JSON, CSV output formatters
+- [x] Basic resource tracking (CPU, RSS, goroutines)
+- [x] Token bucket rate limiter
+- [x] Baseline comparison / regression detection
+- [x] `bench_buffer_pool` — multi-goroutine alloc/free contention
+- [x] `bench_cq_poll` — CQ polling throughput with mock completions
+- [x] `bench_aggregation` — message pack/unpack overhead
+- [x] `bench_channel_vs_mutex` — synchronization primitive comparison
+
+### Phase 2: End-to-End RDMA Transport Integration [CURRENT]
+
+**Goal**: Wire server and client modes to golinker core for real two-node benchmarks.
+
+- [ ] Server transport: initialize RDMA stack (verbs, PD, buffer pools, CQ pool, connection manager)
+- [ ] Echo handler: receive message, send back immediately
+- [ ] Sink handler: receive message, send minimal ACK
+- [ ] Client transport: establish RDMA connections to remote server
+- [ ] `bench_latency` scenario: closed-loop RTT measurement via echo mode
+- [ ] `bench_throughput` scenario: open-loop max msg/sec via sink mode
+- [ ] New transport CLI flags (--device, --queue-depth, --numa-node)
+- [ ] RDMA hardware counter collection (sysfs reader)
+- [ ] Integration test: server + client on same host via SoftRoCE (rxe)
+
+**Deliverable**: `golinker-bench server` on Node A + `golinker-bench client latency` on Node B produces real RDMA latency/throughput/TPS metrics.
+
+### Phase 3: Advanced Scenarios + Stress Tests
+
+**Goal**: Connection scaling, CQ scaling, stress tests, profiling integration.
+
+- [ ] `bench_bandwidth` — large message throughput
 - [ ] `bench_mixed` — Zipf distribution message sizes
-- [ ] CSV time-series output (per-second interval stats)
-
-**Deliverable**: Complete subsystem performance profile; identify bottlenecks.
-
-### Phase 3: Stress Tests + Profiling (Week 5-6)
-
-**Goal**: Validate stability under sustained load; detect resource leaks.
-
-- [ ] `stress_sustained` — 1-hour fixed-rate with per-minute histograms
-- [ ] `stress_burst` — burst/recovery pattern measurement
-- [ ] `stress_memory` — RSS/heap tracking over time, leak detection
-- [ ] `stress_reconnect` — rapid connect/disconnect, goroutine/FD leak detection
-- [ ] pprof integration (CPU, memory, block, trace)
-- [ ] RDMA hardware counter collection
 - [ ] `bench_connections` — scaling with connection count
 - [ ] `bench_cq_scaling` — scaling with CQ count
-- [ ] Warmup period implementation (discard early samples)
+- [ ] `stress_sustained` — 1-hour fixed-rate stability
+- [ ] `stress_burst` — burst/recovery pattern
+- [ ] `stress_memory` — RSS/heap leak detection
+- [ ] `stress_reconnect` — rapid connect/disconnect
+- [ ] pprof integration (CPU, memory, block, trace)
+- [ ] Warmup period (discard early samples from histogram)
 
-**Deliverable**: Confidence in production readiness; no leaks or degradation over time.
+### Phase 4: Controller + CI
 
-### Phase 4: Controller + Comparison (Week 7-8)
-
-**Goal**: Multi-node orchestration and regression comparison workflow.
+**Goal**: Multi-node orchestration and CI regression pipeline.
 
 - [ ] Controller mode: SSH-based remote node management
-- [ ] Multi-client result merging (histogram merge)
-- [ ] Comparison report generation (`--compare` flag)
-- [ ] Regression detection with configurable thresholds
-- [ ] CI pipeline YAML and scripts
-- [ ] Baseline management (store/update/retrieve)
-- [ ] Performance trend tracking (JSON history + plotting script)
-- [ ] Documentation: README for the benchmark tool
-
-**Deliverable**: Full CI-integrated benchmark suite with automated regression detection.
+- [ ] Multi-client histogram merging
+- [ ] CI pipeline YAML (SoftRoCE + hardware gates)
+- [ ] Performance trend tracking
+- [ ] Documentation
 
 ---
 

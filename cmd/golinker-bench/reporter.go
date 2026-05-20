@@ -116,6 +116,13 @@ func (r *Reporter) reportText(w io.Writer, result *BenchResult) error {
 	fmt.Fprintf(w, "  CPU:        %.0f%%\n", result.Resources.CPUPercent)
 	fmt.Fprintf(w, "  RSS:        %.0f MB (peak: %.0f MB)\n", result.Resources.RSSMB, result.Resources.RSSPeakMB)
 	fmt.Fprintf(w, "  Goroutines: %d\n", result.Resources.Goroutines)
+	fmt.Fprintln(w)
+
+	fmt.Fprintf(w, "RDMA Counters:\n")
+	fmt.Fprintf(w, "  TX packets: %d\n", result.RDMACounters.TXPackets)
+	fmt.Fprintf(w, "  RX packets: %d\n", result.RDMACounters.RXPackets)
+	fmt.Fprintf(w, "  TX bytes:   %s\n", humanizeBytes(result.RDMACounters.TXBytes))
+	fmt.Fprintf(w, "  RX bytes:   %s\n", humanizeBytes(result.RDMACounters.RXBytes))
 
 	fmt.Fprintf(w, "\n%s\n", sep)
 	return nil
@@ -143,4 +150,26 @@ func (r *Reporter) reportCSV(w io.Writer, result *BenchResult) error {
 	fmt.Fprintf(w, "cpu_pct,%.0f\n", result.Resources.CPUPercent)
 	fmt.Fprintf(w, "rss_mb,%.0f\n", result.Resources.RSSMB)
 	return nil
+}
+
+// humanizeBytes formats a byte count as a human-readable string.
+func humanizeBytes(b uint64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+		GB = 1024 * MB
+		TB = 1024 * GB
+	)
+	switch {
+	case b >= TB:
+		return fmt.Sprintf("%.2f TB", float64(b)/float64(TB))
+	case b >= GB:
+		return fmt.Sprintf("%.2f GB", float64(b)/float64(GB))
+	case b >= MB:
+		return fmt.Sprintf("%.2f MB", float64(b)/float64(MB))
+	case b >= KB:
+		return fmt.Sprintf("%.2f KB", float64(b)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }

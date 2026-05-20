@@ -20,6 +20,14 @@ var (
 	pprofFlag  bool
 	cpuProfile string
 	memProfile string
+
+	// Transport flags
+	device     string
+	queueDepth int
+	numaNode   int
+	cqNumber   int
+	pollMode   string
+	bufferSize int
 )
 
 func main() {
@@ -39,6 +47,14 @@ func main() {
 	rootCmd.PersistentFlags().BoolVar(&pprofFlag, "pprof", false, "enable pprof on :6060")
 	rootCmd.PersistentFlags().StringVar(&cpuProfile, "cpu-profile", "", "write CPU profile to file")
 	rootCmd.PersistentFlags().StringVar(&memProfile, "mem-profile", "", "write memory profile to file")
+
+	// Transport flags
+	rootCmd.PersistentFlags().StringVar(&device, "device", "", "RDMA device name")
+	rootCmd.PersistentFlags().IntVar(&queueDepth, "queue-depth", 128, "QP send/recv queue depth")
+	rootCmd.PersistentFlags().IntVar(&numaNode, "numa-node", -1, "NUMA node for buffer allocation")
+	rootCmd.PersistentFlags().IntVar(&cqNumber, "cq-number", 2, "number of completion queues")
+	rootCmd.PersistentFlags().StringVar(&pollMode, "poll-mode", "busy", "CQ poll mode: busy, event, smart, user")
+	rootCmd.PersistentFlags().IntVar(&bufferSize, "buffer-size", 12288, "send/recv buffer size in bytes")
 
 	// Add subcommands
 	rootCmd.AddCommand(newServerCmd())
