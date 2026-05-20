@@ -3,28 +3,17 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime/pprof"
-	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/wua20/golinker/api"
 	"github.com/wua20/golinker/internal/rdma"
-)
-
-// ResponseMode determines how the server handles received messages.
-type ResponseMode string
-
-const (
-	ModeEcho ResponseMode = "echo"
-	ModeSink ResponseMode = "sink"
 )
 
 // AtomicStats tracks server statistics concurrently.
@@ -68,22 +57,14 @@ func executeServer(cmd *cobra.Command, args []string) error {
 		defer pprof.StopCPUProfile()
 	}
 
-	// Parse addr into host and port for CM listener
-	host, portStr, err := net.SplitHostPort(addr)
+	ln, err := rdma.Listen(addr, rdma.Config{
+		BufSize:    bufferSize,
+		QueueDepth: queueDepth,
+	})
 	if err != nil {
-		return fmt.Errorf("parsing addr %q: %w", addr, err)
+		return fmt.Errorf("listen: %w", err)
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return fmt.Errorf("invalid port %q: %w", portStr, err)
-	}
-
-	// Initialize CM listener
-	cmChannel, cmAcceptor, err := initCMListener(host, port)
-	if err != nil {
-		return fmt.Errorf("initializing CM listener: %w", err)
-	}
-	defer cmChannel.Close()
+	defer ln.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -93,13 +74,12 @@ func executeServer(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("golinker-bench server starting\n")
 	fmt.Printf("  Address: %s\n", addr)
-	fmt.Printf("  CM listening: %s:%d\n", host, port)
 	fmt.Printf("  Mode: %s\n", mode)
 	fmt.Printf("  Buffer size: %d\n", bufferSize)
 	fmt.Printf("  Queue depth: %d\n", queueDepth)
 	fmt.Printf("Waiting for connections...\n")
 
-	// Stats reporter goroutine
+	// Stats reporter
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -116,78 +96,26 @@ func executeServer(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Accept connections and handle them with direct RDMA data path.
-	// Each accepted connection gets its own PingPongConn and goroutine.
-	//
-	// We track pending connections (accepted but not yet ESTABLISHED) by
-	// their CM ID pointer, so interleaved events from concurrent clients
-	// are matched correctly.
+	// Accept loop
 	go func() {
-		type pendingConn struct {
-			qp api.QueuePair
-		}
-		pending := make(map[uintptr]*pendingConn)
-
 		for {
-			event, err := cmChannel.GetEvent(ctx)
+			conn, err := ln.Accept(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
 				}
-				fmt.Printf("  CM event error: %v\n", err)
+				fmt.Printf("  accept error: %v\n", err)
 				return
 			}
-
-			switch event.Type {
-			case api.EventConnectRequest:
-				qp, err := cmAcceptor.AcceptConn(event.ID, nil, nil, nil, api.QueuePairConfig{
-					MaxSendWR:  queueDepth,
-					MaxRecvWR:  queueDepth,
-					MaxSendSGE: 1,
-					MaxRecvSGE: 1,
-				})
-				if err != nil {
-					fmt.Printf("  accept error: %v\n", err)
-					cmChannel.AckEvent(event)
-					continue
+			fmt.Printf("  Connection established, starting %s loop\n", mode)
+			go func() {
+				defer conn.Close()
+				if mode == "sink" {
+					runSinkLoop(ctx, conn, stats)
+				} else {
+					runEchoLoop(ctx, conn, stats)
 				}
-				// Track this connection; ESTABLISHED will arrive later keyed by the same CM ID.
-				key := uintptr(event.ID)
-				pending[key] = &pendingConn{qp: qp}
-				cmChannel.AckEvent(event)
-
-			case api.EventEstablished:
-				key := uintptr(event.ID)
-				cmChannel.AckEvent(event)
-
-				pc, ok := pending[key]
-				if !ok {
-					fmt.Printf("  ESTABLISHED for unknown CM ID %v\n", event.ID)
-					continue
-				}
-				delete(pending, key)
-
-				fmt.Printf("  Connection established, starting %s loop\n", mode)
-
-				ppConn, err := rdma.NewPingPongFromQP(pc.qp, bufferSize)
-				if err != nil {
-					fmt.Printf("  PingPongConn error: %v\n", err)
-					continue
-				}
-
-				go func() {
-					defer ppConn.Close()
-					if mode == "sink" {
-						runSinkLoop(ctx, ppConn, stats)
-					} else {
-						runEchoLoop(ctx, ppConn, stats)
-					}
-				}()
-
-			default:
-				fmt.Printf("  CM event: type=%d\n", event.Type)
-				cmChannel.AckEvent(event)
-			}
+			}()
 		}
 	}()
 
@@ -208,7 +136,7 @@ func executeServer(cmd *cobra.Command, args []string) error {
 }
 
 // runEchoLoop receives messages and echoes them back.
-func runEchoLoop(ctx context.Context, pp *rdma.PingPongConn, stats *AtomicStats) {
+func runEchoLoop(ctx context.Context, conn *rdma.Conn, stats *AtomicStats) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -216,7 +144,7 @@ func runEchoLoop(ctx context.Context, pp *rdma.PingPongConn, stats *AtomicStats)
 		default:
 		}
 
-		n, err := pp.RecvInPlace()
+		n, err := conn.RecvInPlace()
 		if err != nil {
 			stats.Errors.Add(1)
 			fmt.Printf("  echo recv error: %v\n", err)
@@ -225,9 +153,8 @@ func runEchoLoop(ctx context.Context, pp *rdma.PingPongConn, stats *AtomicStats)
 		stats.MessagesReceived.Add(1)
 		stats.BytesReceived.Add(int64(n))
 
-		// Echo: copy recv buffer to send buffer, then send
-		pp.CopyRecvToSend(n)
-		if err := pp.SendRaw(n); err != nil {
+		conn.CopyRecvToSend(n)
+		if err := conn.SendRaw(n); err != nil {
 			stats.Errors.Add(1)
 			fmt.Printf("  echo send error: %v\n", err)
 			return
@@ -238,7 +165,7 @@ func runEchoLoop(ctx context.Context, pp *rdma.PingPongConn, stats *AtomicStats)
 }
 
 // runSinkLoop receives messages and sends a minimal 4-byte ACK.
-func runSinkLoop(ctx context.Context, pp *rdma.PingPongConn, stats *AtomicStats) {
+func runSinkLoop(ctx context.Context, conn *rdma.Conn, stats *AtomicStats) {
 	ack := []byte{0x41, 0x43, 0x4B, 0x00} // "ACK\0"
 	for {
 		select {
@@ -247,7 +174,7 @@ func runSinkLoop(ctx context.Context, pp *rdma.PingPongConn, stats *AtomicStats)
 		default:
 		}
 
-		n, err := pp.RecvInPlace()
+		n, err := conn.RecvInPlace()
 		if err != nil {
 			stats.Errors.Add(1)
 			fmt.Printf("  sink recv error: %v\n", err)
@@ -256,7 +183,7 @@ func runSinkLoop(ctx context.Context, pp *rdma.PingPongConn, stats *AtomicStats)
 		stats.MessagesReceived.Add(1)
 		stats.BytesReceived.Add(int64(n))
 
-		if err := pp.Send(ack); err != nil {
+		if err := conn.Send(ack); err != nil {
 			stats.Errors.Add(1)
 			fmt.Printf("  sink send error: %v\n", err)
 			return

@@ -4,12 +4,10 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"net"
 	"os"
 	"os/signal"
 	"runtime"
 	"runtime/pprof"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -17,7 +15,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/wua20/golinker/api"
 	"github.com/wua20/golinker/cmd/golinker-bench/histogram"
 	"github.com/wua20/golinker/cmd/golinker-bench/ratelimit"
 	"github.com/wua20/golinker/cmd/golinker-bench/resources"
@@ -186,29 +183,7 @@ func (c *BenchClient) runEndToEnd(scenario string) error {
 	if c.config.Rate > 0 {
 		fmt.Printf("  Rate limit: %d msgs/sec\n", c.config.Rate)
 	}
-	fmt.Printf("  Mode: %s\n", func() string {
-		if c.config.ClosedLoop {
-			return "closed-loop"
-		}
-		return "open-loop"
-	}())
-
-	// Parse addr into host and port for CM dialer
-	host, portStr, err := net.SplitHostPort(c.config.Addr)
-	if err != nil {
-		return fmt.Errorf("parsing addr %q: %w", c.config.Addr, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return fmt.Errorf("invalid port %q: %w", portStr, err)
-	}
-
-	// Initialize CM dialer for real RDMA connections
-	cmDialer, err := initCMDialer()
-	if err != nil {
-		return fmt.Errorf("initializing CM dialer: %w", err)
-	}
-	defer cmDialer.Close()
+	fmt.Printf("  Mode: closed-loop\n")
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.config.Warmup+c.config.Duration+10*time.Second)
 	defer cancel()
@@ -217,38 +192,27 @@ func (c *BenchClient) runEndToEnd(scenario string) error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sigCh; cancel() }()
 
-	// Establish connections and wrap each with PingPongConn
-	ppConns := make([]*rdma.PingPongConn, c.config.Connections)
-	for i := range ppConns {
-		qp, _, err := cmDialer.Dial(ctx, host, port, nil, nil, nil, api.QueuePairConfig{
-			MaxSendWR:  queueDepth,
-			MaxRecvWR:  queueDepth,
-			MaxSendSGE: 1,
-			MaxRecvSGE: 1,
-		})
+	cfg := rdma.Config{BufSize: bufferSize, QueueDepth: queueDepth}
+
+	// Establish connections
+	conns := make([]*rdma.Conn, c.config.Connections)
+	for i := range conns {
+		conn, err := rdma.Dial(ctx, c.config.Addr, cfg)
 		if err != nil {
-			// Clean up already-created connections
 			for j := 0; j < i; j++ {
-				ppConns[j].Close()
+				conns[j].Close()
 			}
 			return fmt.Errorf("connecting [%d]: %w", i, err)
 		}
-		pp, err := rdma.NewPingPongFromQP(qp, bufferSize)
-		if err != nil {
-			for j := 0; j < i; j++ {
-				ppConns[j].Close()
-			}
-			return fmt.Errorf("PingPongConn [%d]: %w", i, err)
-		}
-		ppConns[i] = pp
+		conns[i] = conn
 	}
 	defer func() {
-		for _, pp := range ppConns {
-			pp.Close()
+		for _, conn := range conns {
+			conn.Close()
 		}
 	}()
 
-	fmt.Printf("  %d connection(s) established\n", len(ppConns))
+	fmt.Printf("  %d connection(s) established\n", len(conns))
 
 	// Start resource tracking
 	c.tracker.Start()
@@ -257,7 +221,7 @@ func (c *BenchClient) runEndToEnd(scenario string) error {
 	// Warmup phase
 	fmt.Printf("  Warming up for %v...\n", c.config.Warmup)
 	warmupHist := histogram.New()
-	c.runPingPong(ctx, ppConns, c.config.Warmup, warmupHist)
+	c.runPingPong(ctx, conns, c.config.Warmup, warmupHist)
 
 	// Reset counters after warmup
 	c.msgsSent.Store(0)
@@ -268,7 +232,7 @@ func (c *BenchClient) runEndToEnd(scenario string) error {
 	fmt.Printf("  Running for %v...\n", c.config.Duration)
 	start := time.Now()
 
-	c.runPingPong(ctx, ppConns, c.config.Duration, c.hist)
+	c.runPingPong(ctx, conns, c.config.Duration, c.hist)
 
 	elapsed := time.Since(start)
 
@@ -301,15 +265,15 @@ func (c *BenchClient) runEndToEnd(scenario string) error {
 }
 
 // runPingPong runs a closed-loop ping-pong benchmark: one goroutine per
-// PingPongConn, send then recv before sending next message.
-func (c *BenchClient) runPingPong(ctx context.Context, ppConns []*rdma.PingPongConn, d time.Duration, hist *histogram.Histogram) {
+// connection, send then recv before sending next message.
+func (c *BenchClient) runPingPong(ctx context.Context, conns []*rdma.Conn, d time.Duration, hist *histogram.Histogram) {
 	benchCtx, benchCancel := context.WithTimeout(ctx, d)
 	defer benchCancel()
 
 	var wg sync.WaitGroup
-	for _, pp := range ppConns {
+	for _, conn := range conns {
 		wg.Add(1)
-		go func(pp *rdma.PingPongConn) {
+		go func(conn *rdma.Conn) {
 			defer wg.Done()
 			payload := make([]byte, c.config.MessageSize)
 			rand.Read(payload)
@@ -324,14 +288,14 @@ func (c *BenchClient) runPingPong(ctx context.Context, ppConns []*rdma.PingPongC
 				c.limiter.Wait()
 
 				start := time.Now()
-				if err := pp.Send(payload); err != nil {
+				if err := conn.Send(payload); err != nil {
 					c.errors.Add(1)
 					fmt.Printf("  send error: %v\n", err)
 					return
 				}
 				c.msgsSent.Add(1)
 
-				_, err := pp.Recv(recvBuf)
+				_, err := conn.Recv(recvBuf)
 				if err != nil {
 					c.errors.Add(1)
 					fmt.Printf("  recv error: %v\n", err)
@@ -342,7 +306,7 @@ func (c *BenchClient) runPingPong(ctx context.Context, ppConns []*rdma.PingPongC
 				latency := time.Since(start)
 				hist.Record(latency.Microseconds())
 			}
-		}(pp)
+		}(conn)
 	}
 	wg.Wait()
 }
