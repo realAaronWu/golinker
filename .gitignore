@@ -5,7 +5,7 @@
 bin/
 *.exe
 *.test
-golinker-bench
+/golinker-bench
 
 # Orchestration artifacts (local only)
 .workflow/

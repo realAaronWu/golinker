@@ -16,11 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wua20/golinker/api"
-	"github.com/wua20/golinker/pkg/buffer"
-	"github.com/wua20/golinker/pkg/config"
-	"github.com/wua20/golinker/pkg/connection"
-	"github.com/wua20/golinker/pkg/cq"
-	pkgserver "github.com/wua20/golinker/pkg/server"
+	"github.com/wua20/golinker/internal/rdma"
 )
 
 // ResponseMode determines how the server handles received messages.
@@ -40,53 +36,6 @@ type AtomicStats struct {
 	Errors           atomic.Int64
 }
 
-// EchoHandler echoes received messages back to the sender.
-type EchoHandler struct{ stats *AtomicStats }
-
-// Handle returns the received message as the response.
-func (h *EchoHandler) Handle(conn api.Connection, msg *api.Message) (*api.Message, error) {
-	h.stats.MessagesReceived.Add(1)
-	h.stats.BytesReceived.Add(int64(msg.Length))
-	h.stats.MessagesSent.Add(1)
-	h.stats.BytesSent.Add(int64(msg.Length))
-	return msg, nil
-}
-
-// SinkHandler consumes received messages and returns a minimal acknowledgment.
-type SinkHandler struct{ stats *AtomicStats }
-
-// Handle consumes the message and returns a minimal 4-byte response.
-func (h *SinkHandler) Handle(conn api.Connection, msg *api.Message) (*api.Message, error) {
-	h.stats.MessagesReceived.Add(1)
-	h.stats.BytesReceived.Add(int64(msg.Length))
-	h.stats.MessagesSent.Add(1)
-	return &api.Message{Length: 4}, nil
-}
-
-// BenchServer represents the benchmark server.
-type BenchServer struct {
-	addr     string
-	mode     ResponseMode
-	stats    *AtomicStats
-	verbs    api.Verbs
-	pd       api.ProtectionDomain
-	sendPool *buffer.Pool
-	recvPool *buffer.Pool
-	cqPool   *cq.Pool
-	connMgr  *connection.Manager
-	srv      *pkgserver.Server
-}
-
-// newHandler returns a MessageHandler matching the server's response mode.
-func (s *BenchServer) newHandler() api.MessageHandler {
-	switch s.mode {
-	case ModeSink:
-		return &SinkHandler{stats: s.stats}
-	default:
-		return &EchoHandler{stats: s.stats}
-	}
-}
-
 // executeServer implements the server logic called by the server command.
 func executeServer(cmd *cobra.Command, args []string) error {
 	mode, _ := cmd.Flags().GetString("mode")
@@ -94,11 +43,7 @@ func executeServer(cmd *cobra.Command, args []string) error {
 		mode = "echo"
 	}
 
-	server := &BenchServer{
-		addr:  addr,
-		mode:  ResponseMode(mode),
-		stats: &AtomicStats{},
-	}
+	stats := &AtomicStats{}
 
 	// Start pprof if requested
 	if pprofFlag {
@@ -121,129 +66,117 @@ func executeServer(cmd *cobra.Command, args []string) error {
 		defer pprof.StopCPUProfile()
 	}
 
-	// Initialize RDMA stack
-	verbs, pd, err := initVerbs(device)
-	if err != nil {
-		return fmt.Errorf("initializing RDMA verbs: %w", err)
-	}
-	server.verbs = verbs
-	server.pd = pd
-
-	sendPool, err := newBufferPool(verbs, pd, bufferSize, 128, numaNode)
-	if err != nil {
-		return fmt.Errorf("creating send buffer pool: %w", err)
-	}
-	server.sendPool = sendPool
-	defer sendPool.Close()
-
-	recvPool, err := newBufferPool(verbs, pd, bufferSize, 128, numaNode)
-	if err != nil {
-		return fmt.Errorf("creating recv buffer pool: %w", err)
-	}
-	server.recvPool = recvPool
-	defer recvPool.Close()
-
-	cqp, err := newCQPool(verbs, cqNumber, pollMode)
-	if err != nil {
-		return fmt.Errorf("creating CQ pool: %w", err)
-	}
-	server.cqPool = cqp
-	defer cqp.Close()
-
 	// Parse addr into host and port for CM listener
-	host, portStr, err := net.SplitHostPort(server.addr)
+	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return fmt.Errorf("parsing addr %q: %w", server.addr, err)
+		return fmt.Errorf("parsing addr %q: %w", addr, err)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return fmt.Errorf("invalid port %q: %w", portStr, err)
 	}
 
-	// Initialize CM listener (event channel + acceptor)
+	// Initialize CM listener
 	cmChannel, cmAcceptor, err := initCMListener(host, port)
 	if err != nil {
 		return fmt.Errorf("initializing CM listener: %w", err)
 	}
 	defer cmChannel.Close()
 
-	// Assign send and recv CQs from the pool for QP creation
-	_, sendCQ, err := cqp.Assign()
-	if err != nil {
-		return fmt.Errorf("assigning send CQ: %w", err)
-	}
-	_, recvCQ, err := cqp.Assign()
-	if err != nil {
-		return fmt.Errorf("assigning recv CQ: %w", err)
-	}
-
-	// Create connection manager with CM wiring
-	connMgr := connection.NewManager(connection.ManagerConfig{
-		Verbs:      verbs,
-		CMChannel:  cmChannel,
-		CMAcceptor: cmAcceptor,
-		PD:         pd,
-		SendCQ:     sendCQ,
-		RecvCQ:     recvCQ,
-		QPConfig: api.QueuePairConfig{
-			MaxSendWR:  queueDepth,
-			MaxRecvWR:  queueDepth,
-			MaxSendSGE: 1,
-			MaxRecvSGE: 1,
-		},
-		SendPool:   nil, // buffer.Pool does not implement api.SendBufferPool yet
-		RecvPool:   nil, // buffer.Pool does not implement api.RecvBufferPool yet
-		QueueDepth: queueDepth,
-	})
-	server.connMgr = connMgr
-	defer connMgr.Close()
-
-	// Build server config
-	cfg := config.DefaultConfig()
-	cfg.Endpoint = server.addr
-	cfg.CQNumber = cqNumber
-	cfg.PollMode = parsePollMode(pollMode)
-	cfg.BufferSize = bufferSize
-
-	// Create and configure the pkg/server
-	srv, err := pkgserver.NewServer(cfg, pkgserver.ServerDeps{
-		Verbs:   verbs,
-		ConnMgr: connMgr,
-		CQPool:  cqp,
-		BufPool: sendPool,
-	})
-	if err != nil {
-		return fmt.Errorf("creating server: %w", err)
-	}
-	server.srv = srv
-
-	srv.RegisterHandler(server.newHandler())
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// Start CM event loop to accept incoming connections
-	go connMgr.RunCMEventLoop(ctx)
-
-	if err := srv.Start(ctx); err != nil {
-		return fmt.Errorf("starting server: %w", err)
-	}
-	defer srv.Stop(ctx)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	fmt.Printf("golinker-bench server starting\n")
-	fmt.Printf("  Address: %s\n", server.addr)
+	fmt.Printf("  Address: %s\n", addr)
 	fmt.Printf("  CM listening: %s:%d\n", host, port)
-	fmt.Printf("  Mode: %s\n", server.mode)
+	fmt.Printf("  Mode: %s\n", mode)
 	fmt.Printf("  Buffer size: %d\n", bufferSize)
 	fmt.Printf("  Queue depth: %d\n", queueDepth)
-	fmt.Printf("  CQ pollers: %d\n", cqNumber)
-	fmt.Printf("  Poll mode: %s\n", pollMode)
+	fmt.Printf("Waiting for connections...\n")
 
 	// Stats reporter goroutine
-	go server.reportStats(ctx)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				fmt.Printf("  [stats] recv=%d sent=%d errors=%d\n",
+					stats.MessagesReceived.Load(),
+					stats.MessagesSent.Load(),
+					stats.Errors.Load())
+			}
+		}
+	}()
+
+	// Accept connections and handle them with direct RDMA data path.
+	// Each accepted connection gets its own PingPongConn and goroutine.
+	go func() {
+		for {
+			event, err := cmChannel.GetEvent(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				fmt.Printf("  CM event error: %v\n", err)
+				return
+			}
+
+			if event.Type == api.EventConnectRequest {
+				qp, err := cmAcceptor.AcceptConn(event.ID, nil, nil, nil, api.QueuePairConfig{
+					MaxSendWR:  queueDepth,
+					MaxRecvWR:  queueDepth,
+					MaxSendSGE: 1,
+					MaxRecvSGE: 1,
+				})
+				if err != nil {
+					fmt.Printf("  accept error: %v\n", err)
+					cmChannel.AckEvent(event)
+					continue
+				}
+				cmChannel.AckEvent(event)
+
+				// Wait for ESTABLISHED event
+				estEvent, err := cmChannel.GetEvent(ctx)
+				if err != nil {
+					fmt.Printf("  CM event error waiting for ESTABLISHED: %v\n", err)
+					continue
+				}
+				cmChannel.AckEvent(estEvent)
+
+				if estEvent.Type != api.EventEstablished {
+					fmt.Printf("  unexpected event: wanted ESTABLISHED, got %d\n", estEvent.Type)
+					continue
+				}
+
+				fmt.Printf("  Connection accepted, starting %s loop\n", mode)
+
+				// Create PingPongConn from the accepted QP
+				ppConn, err := rdma.NewPingPongFromQP(qp, bufferSize)
+				if err != nil {
+					fmt.Printf("  PingPongConn error: %v\n", err)
+					continue
+				}
+
+				// Run data loop in a goroutine
+				go func() {
+					defer ppConn.Close()
+					if mode == "sink" {
+						runSinkLoop(ctx, ppConn, stats)
+					} else {
+						runEchoLoop(ctx, ppConn, stats)
+					}
+				}()
+			} else {
+				cmChannel.AckEvent(event)
+			}
+		}
+	}()
 
 	select {
 	case sig := <-sigCh:
@@ -252,31 +185,69 @@ func executeServer(cmd *cobra.Command, args []string) error {
 	case <-ctx.Done():
 	}
 
-	server.printFinalStats()
+	fmt.Printf("\nFinal stats:\n")
+	fmt.Printf("  Messages received: %d\n", stats.MessagesReceived.Load())
+	fmt.Printf("  Messages sent: %d\n", stats.MessagesSent.Load())
+	fmt.Printf("  Bytes received: %d\n", stats.BytesReceived.Load())
+	fmt.Printf("  Bytes sent: %d\n", stats.BytesSent.Load())
+	fmt.Printf("  Errors: %d\n", stats.Errors.Load())
 	return nil
 }
 
-func (s *BenchServer) reportStats(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+// runEchoLoop receives messages and echoes them back.
+func runEchoLoop(ctx context.Context, pp *rdma.PingPongConn, stats *AtomicStats) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			fmt.Printf("  [stats] recv=%d sent=%d errors=%d\n",
-				s.stats.MessagesReceived.Load(),
-				s.stats.MessagesSent.Load(),
-				s.stats.Errors.Load())
+		default:
 		}
+
+		n, err := pp.RecvInPlace()
+		if err != nil {
+			stats.Errors.Add(1)
+			fmt.Printf("  echo recv error: %v\n", err)
+			return
+		}
+		stats.MessagesReceived.Add(1)
+		stats.BytesReceived.Add(int64(n))
+
+		// Echo: copy recv buffer to send buffer, then send
+		pp.CopyRecvToSend(n)
+		if err := pp.SendRaw(n); err != nil {
+			stats.Errors.Add(1)
+			fmt.Printf("  echo send error: %v\n", err)
+			return
+		}
+		stats.MessagesSent.Add(1)
+		stats.BytesSent.Add(int64(n))
 	}
 }
 
-func (s *BenchServer) printFinalStats() {
-	fmt.Printf("\nFinal stats:\n")
-	fmt.Printf("  Messages received: %d\n", s.stats.MessagesReceived.Load())
-	fmt.Printf("  Messages sent: %d\n", s.stats.MessagesSent.Load())
-	fmt.Printf("  Bytes received: %d\n", s.stats.BytesReceived.Load())
-	fmt.Printf("  Bytes sent: %d\n", s.stats.BytesSent.Load())
-	fmt.Printf("  Errors: %d\n", s.stats.Errors.Load())
+// runSinkLoop receives messages and sends a minimal 4-byte ACK.
+func runSinkLoop(ctx context.Context, pp *rdma.PingPongConn, stats *AtomicStats) {
+	ack := []byte{0x41, 0x43, 0x4B, 0x00} // "ACK\0"
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		n, err := pp.RecvInPlace()
+		if err != nil {
+			stats.Errors.Add(1)
+			fmt.Printf("  sink recv error: %v\n", err)
+			return
+		}
+		stats.MessagesReceived.Add(1)
+		stats.BytesReceived.Add(int64(n))
+
+		if err := pp.Send(ack); err != nil {
+			stats.Errors.Add(1)
+			fmt.Printf("  sink send error: %v\n", err)
+			return
+		}
+		stats.MessagesSent.Add(1)
+	}
 }

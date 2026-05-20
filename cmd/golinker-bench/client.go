@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -19,7 +22,7 @@ import (
 	"github.com/wua20/golinker/cmd/golinker-bench/ratelimit"
 	"github.com/wua20/golinker/cmd/golinker-bench/resources"
 	"github.com/wua20/golinker/cmd/golinker-bench/scenarios"
-	"github.com/wua20/golinker/pkg/connection"
+	"github.com/wua20/golinker/internal/rdma"
 )
 
 // BenchClient represents the benchmark client.
@@ -188,29 +191,15 @@ func (c *BenchClient) runEndToEnd(scenario string) error {
 		return "open-loop"
 	}())
 
-	// Initialize RDMA stack
-	verbs, pd, err := initVerbs(device)
+	// Parse addr into host and port for CM dialer
+	host, portStr, err := net.SplitHostPort(c.config.Addr)
 	if err != nil {
-		return fmt.Errorf("init verbs: %w", err)
+		return fmt.Errorf("parsing addr %q: %w", c.config.Addr, err)
 	}
-
-	sendPool, err := newBufferPool(verbs, pd, bufferSize, 128, numaNode)
+	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return fmt.Errorf("creating send buffer pool: %w", err)
+		return fmt.Errorf("invalid port %q: %w", portStr, err)
 	}
-	defer sendPool.Close()
-
-	recvPool, err := newBufferPool(verbs, pd, bufferSize, 128, numaNode)
-	if err != nil {
-		return fmt.Errorf("creating recv buffer pool: %w", err)
-	}
-	defer recvPool.Close()
-
-	cqPool, err := newCQPool(verbs, cqNumber, pollMode)
-	if err != nil {
-		return fmt.Errorf("creating CQ pool: %w", err)
-	}
-	defer cqPool.Close()
 
 	// Initialize CM dialer for real RDMA connections
 	cmDialer, err := initCMDialer()
@@ -219,58 +208,54 @@ func (c *BenchClient) runEndToEnd(scenario string) error {
 	}
 	defer cmDialer.Close()
 
-	// Assign send and recv CQs from the pool for QP creation
-	_, sendCQ, err := cqPool.Assign()
-	if err != nil {
-		return fmt.Errorf("assigning send CQ: %w", err)
-	}
-	_, recvCQ, err := cqPool.Assign()
-	if err != nil {
-		return fmt.Errorf("assigning recv CQ: %w", err)
-	}
-
-	// Create connection manager with CM dialer for outbound connections
-	connMgr := connection.NewManager(connection.ManagerConfig{
-		Verbs:    verbs,
-		CMDialer: cmDialer,
-		PD:       pd,
-		SendCQ:   sendCQ,
-		RecvCQ:   recvCQ,
-		QPConfig: api.QueuePairConfig{
-			MaxSendWR:  queueDepth,
-			MaxRecvWR:  queueDepth,
-			MaxSendSGE: 1,
-			MaxRecvSGE: 1,
-		},
-		QueueDepth: queueDepth,
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), c.config.Warmup+c.config.Duration)
+	ctx, cancel := context.WithTimeout(context.Background(), c.config.Warmup+c.config.Duration+10*time.Second)
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sigCh; cancel() }()
 
-	conns := make([]api.Connection, c.config.Connections)
-	for i := range conns {
-		conn, err := connMgr.Connect(ctx, c.config.Addr)
+	// Establish connections and wrap each with PingPongConn
+	ppConns := make([]*rdma.PingPongConn, c.config.Connections)
+	for i := range ppConns {
+		qp, _, err := cmDialer.Dial(ctx, host, port, nil, nil, nil, api.QueuePairConfig{
+			MaxSendWR:  queueDepth,
+			MaxRecvWR:  queueDepth,
+			MaxSendSGE: 1,
+			MaxRecvSGE: 1,
+		})
 		if err != nil {
-			connMgr.Close()
+			// Clean up already-created connections
+			for j := 0; j < i; j++ {
+				ppConns[j].Close()
+			}
 			return fmt.Errorf("connecting [%d]: %w", i, err)
 		}
-		conns[i] = conn
+		pp, err := rdma.NewPingPongFromQP(qp, bufferSize)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				ppConns[j].Close()
+			}
+			return fmt.Errorf("PingPongConn [%d]: %w", i, err)
+		}
+		ppConns[i] = pp
 	}
-	defer connMgr.Close()
+	defer func() {
+		for _, pp := range ppConns {
+			pp.Close()
+		}
+	}()
+
+	fmt.Printf("  %d connection(s) established\n", len(ppConns))
 
 	// Start resource tracking
 	c.tracker.Start()
 	defer c.tracker.Stop()
 
-	// Warmup phase — send traffic to warm caches and pools
-	warmupHist := histogram.New()
+	// Warmup phase
 	fmt.Printf("  Warming up for %v...\n", c.config.Warmup)
-	c.runSendLoop(ctx, conns, c.config.Warmup, warmupHist)
+	warmupHist := histogram.New()
+	c.runPingPong(ctx, ppConns, c.config.Warmup, warmupHist)
 
 	// Reset counters after warmup
 	c.msgsSent.Store(0)
@@ -281,11 +266,7 @@ func (c *BenchClient) runEndToEnd(scenario string) error {
 	fmt.Printf("  Running for %v...\n", c.config.Duration)
 	start := time.Now()
 
-	if c.config.ClosedLoop || scenario == "latency" {
-		c.runClosedLoop(ctx, conns, c.config.Duration)
-	} else {
-		c.runOpenLoop(ctx, conns, c.config.Duration)
-	}
+	c.runPingPong(ctx, ppConns, c.config.Duration, c.hist)
 
 	elapsed := time.Since(start)
 
@@ -317,54 +298,21 @@ func (c *BenchClient) runEndToEnd(scenario string) error {
 	return reporter.Report(result)
 }
 
-// runSendLoop sends messages for the given duration, recording latency into hist.
-// Used for both warmup and the open-loop benchmark phase.
-func (c *BenchClient) runSendLoop(ctx context.Context, conns []api.Connection, d time.Duration, hist *histogram.Histogram) {
-	loopCtx, loopCancel := context.WithTimeout(ctx, d)
-	defer loopCancel()
-
-	var wg sync.WaitGroup
-	for i := 0; i < c.config.Goroutines; i++ {
-		wg.Add(1)
-		conn := conns[i%len(conns)]
-		go func(conn api.Connection) {
-			defer wg.Done()
-			msg := &api.Message{Length: c.config.MessageSize}
-			for {
-				select {
-				case <-loopCtx.Done():
-					return
-				default:
-				}
-				c.limiter.Wait()
-				sendStart := time.Now()
-				if err := conn.Send(msg); err != nil {
-					c.errors.Add(1)
-					continue
-				}
-				latency := time.Since(sendStart)
-				hist.Record(latency.Microseconds())
-				c.msgsSent.Add(1)
-			}
-		}(conn)
-	}
-	wg.Wait()
-}
-
-// runClosedLoop implements a closed-loop benchmark: one goroutine per connection,
-// send then wait for response before sending the next message.
-func (c *BenchClient) runClosedLoop(ctx context.Context, conns []api.Connection, d time.Duration) {
+// runPingPong runs a closed-loop ping-pong benchmark: one goroutine per
+// PingPongConn, send then recv before sending next message.
+func (c *BenchClient) runPingPong(ctx context.Context, ppConns []*rdma.PingPongConn, d time.Duration, hist *histogram.Histogram) {
 	benchCtx, benchCancel := context.WithTimeout(ctx, d)
 	defer benchCancel()
 
 	var wg sync.WaitGroup
-	for _, conn := range conns {
+	for _, pp := range ppConns {
 		wg.Add(1)
-		go func(conn api.Connection) {
+		go func(pp *rdma.PingPongConn) {
 			defer wg.Done()
-			msg := &api.Message{Length: c.config.MessageSize}
-			// Short deadline for Recv so the mock build does not hang.
-			const recvTimeout = 50 * time.Millisecond
+			payload := make([]byte, c.config.MessageSize)
+			rand.Read(payload)
+			recvBuf := make([]byte, bufferSize)
+
 			for {
 				select {
 				case <-benchCtx.Done():
@@ -372,83 +320,27 @@ func (c *BenchClient) runClosedLoop(ctx context.Context, conns []api.Connection,
 				default:
 				}
 				c.limiter.Wait()
+
 				start := time.Now()
-				if err := conn.Send(msg); err != nil {
+				if err := pp.Send(payload); err != nil {
 					c.errors.Add(1)
-					continue
+					fmt.Printf("  send error: %v\n", err)
+					return
 				}
 				c.msgsSent.Add(1)
 
-				// Wait for echo response; use a short per-recv deadline
-				// so mock builds (where no echo arrives) don't block.
-				recvCtx, recvCancel := context.WithTimeout(benchCtx, recvTimeout)
-				_, err := conn.Recv(recvCtx)
-				recvCancel()
+				_, err := pp.Recv(recvBuf)
 				if err != nil {
-					// In mock mode Recv always times out; count the
-					// send latency only and continue.
-					latency := time.Since(start)
-					c.hist.Record(latency.Microseconds())
-					continue
+					c.errors.Add(1)
+					fmt.Printf("  recv error: %v\n", err)
+					return
 				}
+				c.msgsRecv.Add(1)
+
 				latency := time.Since(start)
-				c.hist.Record(latency.Microseconds())
-				c.msgsRecv.Add(1)
+				hist.Record(latency.Microseconds())
 			}
-		}(conn)
+		}(pp)
 	}
-	wg.Wait()
-}
-
-// runOpenLoop implements an open-loop benchmark: N sender goroutines
-// round-robin across connections, with separate receiver goroutines
-// draining responses.
-func (c *BenchClient) runOpenLoop(ctx context.Context, conns []api.Connection, d time.Duration) {
-	benchCtx, benchCancel := context.WithTimeout(ctx, d)
-	defer benchCancel()
-
-	var wg sync.WaitGroup
-
-	// Sender goroutines
-	for i := 0; i < c.config.Goroutines; i++ {
-		wg.Add(1)
-		conn := conns[i%len(conns)]
-		go func(conn api.Connection) {
-			defer wg.Done()
-			msg := &api.Message{Length: c.config.MessageSize}
-			for {
-				select {
-				case <-benchCtx.Done():
-					return
-				default:
-				}
-				c.limiter.Wait()
-				sendStart := time.Now()
-				if err := conn.Send(msg); err != nil {
-					c.errors.Add(1)
-					continue
-				}
-				latency := time.Since(sendStart)
-				c.hist.Record(latency.Microseconds())
-				c.msgsSent.Add(1)
-			}
-		}(conn)
-	}
-
-	// Receiver goroutines -- one per connection
-	for _, conn := range conns {
-		wg.Add(1)
-		go func(conn api.Connection) {
-			defer wg.Done()
-			for {
-				_, err := conn.Recv(benchCtx)
-				if err != nil {
-					return
-				}
-				c.msgsRecv.Add(1)
-			}
-		}(conn)
-	}
-
 	wg.Wait()
 }
