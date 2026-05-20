@@ -116,11 +116,39 @@ func (r *RealCMEventChannel) Close() error {
 
 // AcceptConn creates a QP on the incoming CM ID, accepts the connection,
 // and returns the ready QueuePair.
+// Note: the pd, sendCQ, recvCQ parameters are ignored for real RDMA because
+// rdma_create_qp requires resources from the CM ID's own ibv_context.
+// PD and CQs are created from the incoming CM ID's verbs context.
 func (r *RealCMEventChannel) AcceptConn(cmID unsafe.Pointer, pd api.ProtectionDomain, sendCQ, recvCQ api.CompletionQueue, cfg api.QueuePairConfig) (api.QueuePair, error) {
 	id := (*C.struct_rdma_cm_id)(cmID)
-	cPD := (*C.struct_ibv_pd)(pd.Handle())
-	cSendCQ := (*C.struct_ibv_cq)(sendCQ.Handle())
-	cRecvCQ := (*C.struct_ibv_cq)(recvCQ.Handle())
+
+	// Create PD and CQs from the incoming CM ID's verbs context.
+	// The incoming CM ID (from CONNECT_REQUEST) has id->verbs set by the kernel.
+	cmPD := C.ibv_alloc_pd(id.verbs)
+	if cmPD == nil {
+		return nil, fmt.Errorf("ibv_alloc_pd on CM context failed")
+	}
+
+	cqSize := cfg.MaxSendWR
+	if cfg.MaxRecvWR > cqSize {
+		cqSize = cfg.MaxRecvWR
+	}
+	if cqSize < 128 {
+		cqSize = 128
+	}
+
+	cmSendCQ := C.ibv_create_cq(id.verbs, C.int(cqSize), nil, nil, 0)
+	if cmSendCQ == nil {
+		C.ibv_dealloc_pd(cmPD)
+		return nil, fmt.Errorf("ibv_create_cq (send) on CM context failed")
+	}
+
+	cmRecvCQ := C.ibv_create_cq(id.verbs, C.int(cqSize), nil, nil, 0)
+	if cmRecvCQ == nil {
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
+		return nil, fmt.Errorf("ibv_create_cq (recv) on CM context failed")
+	}
 
 	qpCfg := QPConfig{
 		MaxSendWR:     cfg.MaxSendWR,
@@ -131,11 +159,17 @@ func (r *RealCMEventChannel) AcceptConn(cmID unsafe.Pointer, pd api.ProtectionDo
 		SQSigAll:      cfg.SQSigAll,
 	}
 
-	if err := CreateQP(id, cPD, cSendCQ, cRecvCQ, qpCfg); err != nil {
+	if err := CreateQP(id, cmPD, cmSendCQ, cmRecvCQ, qpCfg); err != nil {
+		C.ibv_destroy_cq(cmRecvCQ)
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
 		return nil, fmt.Errorf("create qp: %w", err)
 	}
 
 	if err := Accept(id, nil); err != nil {
+		C.ibv_destroy_cq(cmRecvCQ)
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
 		return nil, fmt.Errorf("accept: %w", err)
 	}
 
@@ -147,11 +181,15 @@ func (r *RealCMEventChannel) AcceptConn(cmID unsafe.Pointer, pd api.ProtectionDo
 // ---------------------------------------------------------------------------
 
 // RealCMDialer handles client-side RDMA connection establishment.
-// Each Dial creates its own event channel and CM ID.
+// Each Dial creates its own event channel and CM ID. PD and CQs are
+// created from the CM ID's verbs context (set after address resolution)
+// because rdma_create_qp requires all resources on the same ibv_context.
 type RealCMDialer struct{}
 
 // Dial performs the full RDMA CM connection handshake:
-// resolve-addr -> resolve-route -> create-QP -> connect.
+// resolve-addr -> create PD/CQs from CM context -> resolve-route -> create-QP -> connect.
+// Note: the pd, sendCQ, recvCQ parameters are ignored for real RDMA because
+// rdma_create_qp requires resources from the CM ID's own ibv_context.
 func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.ProtectionDomain, sendCQ, recvCQ api.CompletionQueue, cfg api.QueuePairConfig) (api.QueuePair, unsafe.Pointer, error) {
 	ch, err := CreateEventChannel()
 	if err != nil {
@@ -187,8 +225,46 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	}
 	C.rdma_ack_cm_event(event)
 
-	// Step 2: Resolve route.
+	// Step 2: Create PD and CQs from the CM ID's verbs context.
+	// After addr resolution, id->verbs is set. All QP resources must come
+	// from this context; using a separately-opened ibv_context will fail.
+	cmPD := C.ibv_alloc_pd(id.verbs)
+	if cmPD == nil {
+		DestroyID(id)
+		DestroyEventChannel(ch)
+		return nil, nil, fmt.Errorf("ibv_alloc_pd on CM context failed")
+	}
+
+	cqSize := cfg.MaxSendWR
+	if cfg.MaxRecvWR > cqSize {
+		cqSize = cfg.MaxRecvWR
+	}
+	if cqSize < 128 {
+		cqSize = 128
+	}
+
+	cmSendCQ := C.ibv_create_cq(id.verbs, C.int(cqSize), nil, nil, 0)
+	if cmSendCQ == nil {
+		C.ibv_dealloc_pd(cmPD)
+		DestroyID(id)
+		DestroyEventChannel(ch)
+		return nil, nil, fmt.Errorf("ibv_create_cq (send) on CM context failed")
+	}
+
+	cmRecvCQ := C.ibv_create_cq(id.verbs, C.int(cqSize), nil, nil, 0)
+	if cmRecvCQ == nil {
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
+		DestroyID(id)
+		DestroyEventChannel(ch)
+		return nil, nil, fmt.Errorf("ibv_create_cq (recv) on CM context failed")
+	}
+
+	// Step 3: Resolve route.
 	if err := ResolveRoute(id, 2000); err != nil {
+		C.ibv_destroy_cq(cmRecvCQ)
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
 		return nil, nil, fmt.Errorf("resolve route: %w", err)
@@ -197,22 +273,25 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	// Wait for ROUTE_RESOLVED.
 	ret = C.rdma_get_cm_event(ch, &event)
 	if ret != 0 {
+		C.ibv_destroy_cq(cmRecvCQ)
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
 		return nil, nil, fmt.Errorf("rdma_get_cm_event (route): %d", ret)
 	}
 	if mapCMEventType(event.event) != CMEventRouteResolved {
 		C.rdma_ack_cm_event(event)
+		C.ibv_destroy_cq(cmRecvCQ)
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
 		return nil, nil, fmt.Errorf("unexpected event: wanted ROUTE_RESOLVED, got %d", event.event)
 	}
 	C.rdma_ack_cm_event(event)
 
-	// Step 3: Create QP on the CM ID.
-	cPD := (*C.struct_ibv_pd)(pd.Handle())
-	cSendCQ := (*C.struct_ibv_cq)(sendCQ.Handle())
-	cRecvCQ := (*C.struct_ibv_cq)(recvCQ.Handle())
+	// Step 4: Create QP on the CM ID using CM-context PD and CQs.
 	qpCfg := QPConfig{
 		MaxSendWR:     cfg.MaxSendWR,
 		MaxRecvWR:     cfg.MaxRecvWR,
@@ -221,14 +300,20 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 		MaxInlineData: cfg.MaxInlineData,
 		SQSigAll:      cfg.SQSigAll,
 	}
-	if err := CreateQP(id, cPD, cSendCQ, cRecvCQ, qpCfg); err != nil {
+	if err := CreateQP(id, cmPD, cmSendCQ, cmRecvCQ, qpCfg); err != nil {
+		C.ibv_destroy_cq(cmRecvCQ)
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
 		return nil, nil, fmt.Errorf("create qp: %w", err)
 	}
 
-	// Step 4: Connect.
+	// Step 5: Connect.
 	if err := Connect(id, nil); err != nil {
+		C.ibv_destroy_cq(cmRecvCQ)
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
 		return nil, nil, fmt.Errorf("connect: %w", err)
@@ -237,12 +322,18 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	// Wait for ESTABLISHED.
 	ret = C.rdma_get_cm_event(ch, &event)
 	if ret != 0 {
+		C.ibv_destroy_cq(cmRecvCQ)
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
 		return nil, nil, fmt.Errorf("rdma_get_cm_event (established): %d", ret)
 	}
 	if mapCMEventType(event.event) != CMEventEstablished {
 		C.rdma_ack_cm_event(event)
+		C.ibv_destroy_cq(cmRecvCQ)
+		C.ibv_destroy_cq(cmSendCQ)
+		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
 		return nil, nil, fmt.Errorf("unexpected event: wanted ESTABLISHED, got %d", event.event)
