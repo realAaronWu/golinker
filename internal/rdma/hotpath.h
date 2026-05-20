@@ -25,6 +25,11 @@ typedef struct {
     uint64_t wr_id;
 } send_item_t;
 
+// Accessor for ibv_wc.imm_data which lives in an anonymous union (inaccessible from CGo).
+static inline uint32_t golinker_wc_imm_data(const struct ibv_wc *wc) {
+    return wc->imm_data;
+}
+
 // Poll CQ for completions AND re-post previous batch receive buffers in one CGo call.
 // Returns number of completions (>=0), or negative errno on failure.
 int golinker_poll_and_repost(struct ibv_cq *cq, struct ibv_wc *wcs, int max_wcs,

@@ -231,7 +231,7 @@ func PollCQ(cq *C.struct_ibv_cq, maxWCs int, reposts []RepostItem) ([]WorkComple
 			Opcode:  int(wcs[i].opcode),
 			ByteLen: uint32(wcs[i].byte_len),
 			QPN:     uint32(wcs[i].qp_num),
-			ImmData: uint32(wcs[i].imm_data),
+			ImmData: uint32(C.golinker_wc_imm_data(&wcs[i])),
 		}
 	}
 	return completions, nil
