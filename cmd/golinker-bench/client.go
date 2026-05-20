@@ -39,6 +39,8 @@ type BenchClient struct {
 
 // executeClient implements the client benchmark logic.
 func executeClient(cmd *cobra.Command, args []string) error {
+	rdma.DebugLog = verbose
+
 	if len(args) < 1 {
 		return fmt.Errorf("scenario required (e.g., latency, throughput, buffer-pool)")
 	}

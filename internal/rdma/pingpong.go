@@ -48,6 +48,9 @@ type PingPongConn struct {
 func NewPingPongFromQP(qp api.QueuePair, bufSize int) (*PingPongConn, error) {
 	cQP := (*C.struct_ibv_qp)(qp.Handle())
 
+	debugf("PingPong: init from QP=%p (qp_num=%d), bufSize=%d", cQP, cQP.qp_num, bufSize)
+	debugf("PingPong: PD=%p sendCQ=%p recvCQ=%p", cQP.pd, cQP.send_cq, cQP.recv_cq)
+
 	p := &PingPongConn{
 		qp:      cQP,
 		pd:      cQP.pd,
@@ -89,12 +92,16 @@ func NewPingPongFromQP(qp api.QueuePair, bufSize int) (*PingPongConn, error) {
 		return nil, fmt.Errorf("ibv_reg_mr recv buffer failed")
 	}
 
+	debugf("PingPong: sendBuf=%p sendMR(lkey=%d) recvBuf=%p recvMR(lkey=%d)",
+		p.sendBuf, p.sendMR.lkey, p.recvBuf, p.recvMR.lkey)
+
 	// Pre-post a recv WR so we're ready to receive.
 	if err := p.postRecv(); err != nil {
 		p.Close()
 		return nil, fmt.Errorf("initial post recv: %w", err)
 	}
 
+	debugf("PingPong: ready (initial recv WR posted)")
 	return p, nil
 }
 

@@ -33,12 +33,14 @@ type RealCMEventChannel struct {
 // Listen creates an RDMA CM event channel, binds to the given address and port,
 // and starts listening for incoming connections.
 func (r *RealCMEventChannel) Listen(ctx context.Context, addr string, port int) error {
+	debugf("Listen: creating event channel")
 	ch, err := CreateEventChannel()
 	if err != nil {
 		return fmt.Errorf("create event channel: %w", err)
 	}
 	r.ch = ch
 
+	debugf("Listen: creating CM ID")
 	id, err := CreateID(ch)
 	if err != nil {
 		DestroyEventChannel(ch)
@@ -47,6 +49,7 @@ func (r *RealCMEventChannel) Listen(ctx context.Context, addr string, port int) 
 	}
 	r.listenID = id
 
+	debugf("Listen: binding to %s:%d", addr, port)
 	if err := BindAddr(id, addr, port); err != nil {
 		DestroyID(id)
 		DestroyEventChannel(ch)
@@ -55,6 +58,7 @@ func (r *RealCMEventChannel) Listen(ctx context.Context, addr string, port int) 
 		return fmt.Errorf("bind addr: %w", err)
 	}
 
+	debugf("Listen: starting listen (backlog=128)")
 	if err := Listen(id, 128); err != nil {
 		DestroyID(id)
 		DestroyEventChannel(ch)
@@ -63,6 +67,7 @@ func (r *RealCMEventChannel) Listen(ctx context.Context, addr string, port int) 
 		return fmt.Errorf("listen: %w", err)
 	}
 
+	debugf("Listen: ready on %s:%d", addr, port)
 	return nil
 }
 
@@ -121,6 +126,7 @@ func (r *RealCMEventChannel) Close() error {
 // PD and CQs are created from the incoming CM ID's verbs context.
 func (r *RealCMEventChannel) AcceptConn(cmID unsafe.Pointer, pd api.ProtectionDomain, sendCQ, recvCQ api.CompletionQueue, cfg api.QueuePairConfig) (api.QueuePair, error) {
 	id := (*C.struct_rdma_cm_id)(cmID)
+	debugf("AcceptConn: CM ID=%p, verbs=%p", id, id.verbs)
 
 	// Create PD and CQs from the incoming CM ID's verbs context.
 	// The incoming CM ID (from CONNECT_REQUEST) has id->verbs set by the kernel.
@@ -159,6 +165,7 @@ func (r *RealCMEventChannel) AcceptConn(cmID unsafe.Pointer, pd api.ProtectionDo
 		SQSigAll:      cfg.SQSigAll,
 	}
 
+	debugf("AcceptConn: creating QP (send_wr=%d recv_wr=%d)", cfg.MaxSendWR, cfg.MaxRecvWR)
 	if err := CreateQP(id, cmPD, cmSendCQ, cmRecvCQ, qpCfg); err != nil {
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
@@ -166,6 +173,7 @@ func (r *RealCMEventChannel) AcceptConn(cmID unsafe.Pointer, pd api.ProtectionDo
 		return nil, fmt.Errorf("create qp: %w", err)
 	}
 
+	debugf("AcceptConn: calling rdma_accept")
 	if err := Accept(id, nil); err != nil {
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
@@ -173,7 +181,8 @@ func (r *RealCMEventChannel) AcceptConn(cmID unsafe.Pointer, pd api.ProtectionDo
 		return nil, fmt.Errorf("accept: %w", err)
 	}
 
-	return &RealQP{qp: id.qp}, nil
+	debugf("AcceptConn: done, QP=%p qp_num=%d", id.qp, id.qp.qp_num)
+	return &RealQP{qp: id.qp, state: api.QPStateRTS}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -184,13 +193,22 @@ func (r *RealCMEventChannel) AcceptConn(cmID unsafe.Pointer, pd api.ProtectionDo
 // Each Dial creates its own event channel and CM ID. PD and CQs are
 // created from the CM ID's verbs context (set after address resolution)
 // because rdma_create_qp requires all resources on the same ibv_context.
-type RealCMDialer struct{}
+type RealCMDialer struct {
+	// channels tracks event channels created by Dial() calls so they can
+	// be cleaned up in Close(). Each Dial creates its own channel; the
+	// channel must outlive the CM ID (rdma_destroy_id needs it).
+	channels []*C.struct_rdma_event_channel
+	// ids tracks CM IDs created by Dial() for cleanup.
+	ids []*C.struct_rdma_cm_id
+}
 
 // Dial performs the full RDMA CM connection handshake:
 // resolve-addr -> create PD/CQs from CM context -> resolve-route -> create-QP -> connect.
 // Note: the pd, sendCQ, recvCQ parameters are ignored for real RDMA because
 // rdma_create_qp requires resources from the CM ID's own ibv_context.
 func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.ProtectionDomain, sendCQ, recvCQ api.CompletionQueue, cfg api.QueuePairConfig) (api.QueuePair, unsafe.Pointer, error) {
+	debugf("Dial: target=%s:%d", addr, port)
+
 	ch, err := CreateEventChannel()
 	if err != nil {
 		return nil, nil, fmt.Errorf("create event channel: %w", err)
@@ -203,6 +221,7 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	}
 
 	// Step 1: Resolve address.
+	debugf("Dial: resolving address %s:%d", addr, port)
 	if err := ResolveAddr(id, addr, port, 2000); err != nil {
 		DestroyID(id)
 		DestroyEventChannel(ch)
@@ -226,6 +245,7 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	C.rdma_ack_cm_event(event)
 
 	// Step 2: Create PD and CQs from the CM ID's verbs context.
+	debugf("Dial: ADDR_RESOLVED, creating PD/CQs from verbs=%p", id.verbs)
 	// After addr resolution, id->verbs is set. All QP resources must come
 	// from this context; using a separately-opened ibv_context will fail.
 	cmPD := C.ibv_alloc_pd(id.verbs)
@@ -261,6 +281,7 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	}
 
 	// Step 3: Resolve route.
+	debugf("Dial: resolving route")
 	if err := ResolveRoute(id, 2000); err != nil {
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
@@ -292,6 +313,7 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	C.rdma_ack_cm_event(event)
 
 	// Step 4: Create QP on the CM ID using CM-context PD and CQs.
+	debugf("Dial: ROUTE_RESOLVED, creating QP")
 	qpCfg := QPConfig{
 		MaxSendWR:     cfg.MaxSendWR,
 		MaxRecvWR:     cfg.MaxRecvWR,
@@ -310,6 +332,7 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	}
 
 	// Step 5: Connect.
+	debugf("Dial: QP created (qp_num=%d), connecting", id.qp.qp_num)
 	if err := Connect(id, nil); err != nil {
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
@@ -340,7 +363,13 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	}
 	C.rdma_ack_cm_event(event)
 
-	return &RealQP{qp: id.qp}, unsafe.Pointer(id), nil
+	debugf("Dial: ESTABLISHED, connection ready (qp_num=%d)", id.qp.qp_num)
+
+	// Track for cleanup in Close().
+	d.channels = append(d.channels, ch)
+	d.ids = append(d.ids, id)
+
+	return &RealQP{qp: id.qp, state: api.QPStateRTS}, unsafe.Pointer(id), nil
 }
 
 // Disconnect disconnects an RDMA connection.
@@ -348,9 +377,21 @@ func (d *RealCMDialer) Disconnect(cmID unsafe.Pointer) error {
 	return Disconnect((*C.struct_rdma_cm_id)(cmID))
 }
 
-// Close is a no-op; each Dial creates its own resources.
+// Close destroys all CM IDs and event channels created by Dial() calls.
+// CM IDs must be destroyed before their event channels.
 func (d *RealCMDialer) Close() error {
-	return nil
+	var firstErr error
+	for _, id := range d.ids {
+		if err := DestroyID(id); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	d.ids = nil
+	for _, ch := range d.channels {
+		DestroyEventChannel(ch)
+	}
+	d.channels = nil
+	return firstErr
 }
 
 // Compile-time interface checks.

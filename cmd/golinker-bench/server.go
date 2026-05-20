@@ -38,6 +38,8 @@ type AtomicStats struct {
 
 // executeServer implements the server logic called by the server command.
 func executeServer(cmd *cobra.Command, args []string) error {
+	rdma.DebugLog = verbose
+
 	mode, _ := cmd.Flags().GetString("mode")
 	if mode == "" {
 		mode = "echo"
@@ -116,7 +118,16 @@ func executeServer(cmd *cobra.Command, args []string) error {
 
 	// Accept connections and handle them with direct RDMA data path.
 	// Each accepted connection gets its own PingPongConn and goroutine.
+	//
+	// We track pending connections (accepted but not yet ESTABLISHED) by
+	// their CM ID pointer, so interleaved events from concurrent clients
+	// are matched correctly.
 	go func() {
+		type pendingConn struct {
+			qp api.QueuePair
+		}
+		pending := make(map[uintptr]*pendingConn)
+
 		for {
 			event, err := cmChannel.GetEvent(ctx)
 			if err != nil {
@@ -127,7 +138,8 @@ func executeServer(cmd *cobra.Command, args []string) error {
 				return
 			}
 
-			if event.Type == api.EventConnectRequest {
+			switch event.Type {
+			case api.EventConnectRequest:
 				qp, err := cmAcceptor.AcceptConn(event.ID, nil, nil, nil, api.QueuePairConfig{
 					MaxSendWR:  queueDepth,
 					MaxRecvWR:  queueDepth,
@@ -139,31 +151,30 @@ func executeServer(cmd *cobra.Command, args []string) error {
 					cmChannel.AckEvent(event)
 					continue
 				}
+				// Track this connection; ESTABLISHED will arrive later keyed by the same CM ID.
+				key := uintptr(event.ID)
+				pending[key] = &pendingConn{qp: qp}
 				cmChannel.AckEvent(event)
 
-				// Wait for ESTABLISHED event
-				estEvent, err := cmChannel.GetEvent(ctx)
-				if err != nil {
-					fmt.Printf("  CM event error waiting for ESTABLISHED: %v\n", err)
+			case api.EventEstablished:
+				key := uintptr(event.ID)
+				cmChannel.AckEvent(event)
+
+				pc, ok := pending[key]
+				if !ok {
+					fmt.Printf("  ESTABLISHED for unknown CM ID %v\n", event.ID)
 					continue
 				}
-				cmChannel.AckEvent(estEvent)
+				delete(pending, key)
 
-				if estEvent.Type != api.EventEstablished {
-					fmt.Printf("  unexpected event: wanted ESTABLISHED, got %d\n", estEvent.Type)
-					continue
-				}
+				fmt.Printf("  Connection established, starting %s loop\n", mode)
 
-				fmt.Printf("  Connection accepted, starting %s loop\n", mode)
-
-				// Create PingPongConn from the accepted QP
-				ppConn, err := rdma.NewPingPongFromQP(qp, bufferSize)
+				ppConn, err := rdma.NewPingPongFromQP(pc.qp, bufferSize)
 				if err != nil {
 					fmt.Printf("  PingPongConn error: %v\n", err)
 					continue
 				}
 
-				// Run data loop in a goroutine
 				go func() {
 					defer ppConn.Close()
 					if mode == "sink" {
@@ -172,7 +183,9 @@ func executeServer(cmd *cobra.Command, args []string) error {
 						runEchoLoop(ctx, ppConn, stats)
 					}
 				}()
-			} else {
+
+			default:
+				fmt.Printf("  CM event: type=%d\n", event.Type)
 				cmChannel.AckEvent(event)
 			}
 		}
