@@ -23,6 +23,7 @@ with the raw performance previously available only to C/C++ RDMA applications.
 11. [Wire Format](#11-wire-format)
 12. [Tradeoff Analysis](#12-tradeoff-analysis)
 13. [Comparison with State of the Art](#13-comparison-with-state-of-the-art)
+14. [Data Path Integration](#14-data-path-integration)
 
 ---
 
@@ -1196,6 +1197,188 @@ performance, and 40-100x faster than gRPC over TCP.
    means an HTTP handler's 500 ms deadline propagates all the way through the RDMA
    send path — if the deadline passes, the send is cancelled rather than blocking
    indefinitely.
+
+---
+
+## 14. Data Path Integration
+
+### 14.1 The Problem: Cross-Cutting Data Flow
+
+Sections 4–9 describe the RDMA data path in detail: buffer pools provide registered
+memory, CQ pollers reap completions, connections post send/recv work requests. The
+architecture is modular — each subsystem has clean interfaces and can be developed and
+tested independently.
+
+However, **the data path is inherently cross-cutting**. A single message traverses
+every module in sequence:
+
+```
+SendBufferPool.AcquireForSend()     ─── pkg/buffer/
+  → Copy message into registered buffer
+  → ibv_post_send(buffer, SIGNALED)  ─── internal/rdma/ via pkg/connection/
+  → ...NIC transmits...
+  → ibv_poll_cq() reaps send completion ─── pkg/cq/
+  → SendBufferPool.CompleteSend()    ─── pkg/buffer/
+
+                                     ...on the receiver...
+
+  RecvBufferPool.PostRecvBuffers()   ─── pkg/buffer/  (at connection setup)
+  → ...NIC writes into pre-posted recv buffer...
+  → ibv_poll_cq() reaps recv completion ─── pkg/cq/
+  → Connection.DeliverRecv()         ─── pkg/connection/
+  → RecvBufferPool.Replenish()       ─── pkg/buffer/
+```
+
+No single package owns this flow. It requires explicit wiring code that calls
+interfaces from buffer, CQ, and connection packages in the correct order, with the
+correct RDMA semantics at each step.
+
+### 14.2 Five Required Operations
+
+An RDMA QP in RTS (Ready to Send) state is necessary but not sufficient for data
+transfer. Five operations must be performed before the first message can flow:
+
+| # | Operation | RDMA Requirement | Consequence if Missing |
+|---|-----------|-----------------|----------------------|
+| 1 | **Buffer allocation** | Send/recv buffers must exist in stable (non-GC-movable) memory | Segfault or DMA to stale address |
+| 2 | **Memory registration** (`ibv_reg_mr`) | NIC needs LKey/RKey to DMA to/from a buffer | `IBV_WC_LOC_PROT_ERR` on any verb |
+| 3 | **Recv WR posting** (`ibv_post_recv`) | Receiver must have pre-posted buffers before sender transmits | Sender gets RNR NAK → retries exhaust → connection reset |
+| 4 | **Send signaling** (`IBV_SEND_SIGNALED`) | At least every Nth send must be signaled to reap completions | Send queue fills after `max_send_wr` posts, all subsequent sends fail |
+| 5 | **CQ polling** (`ibv_poll_cq`) | Completions must be reaped to free SQ/RQ slots and deliver data | Send queue and recv queue exhaust; data arrives but is never delivered |
+
+These are not optional. Omitting any one of them causes silent data path failure —
+the connection appears established (CM state = ESTABLISHED) but zero messages flow.
+
+### 14.3 Why This Was Missed in Initial Implementation
+
+The initial build used a multi-agent parallel strategy (see `execution_plan.md`)
+where work was partitioned by package boundary:
+
+- Agent 2A → `pkg/buffer/` (pools, MR registration)
+- Agent 2B → `pkg/cq/` (polling, dispatch)
+- Agent 2C → `pkg/connection/` (lifecycle, state machine)
+
+Each agent built its module with mock dependencies and verified with mock tests. The
+decomposition optimized for parallelism and conflict avoidance (zero merge conflicts
+across all phases). But it created a blind spot: **nobody was assigned the cross-cutting
+wiring that connects these modules into a working data path.**
+
+Specifically:
+
+1. `RecvBufferPool.PostRecvBuffers()` was implemented in `pkg/buffer/` but never
+   called during connection establishment or server accept.
+
+2. `CompletionHandler.OnCompletion()` was implemented in `pkg/cq/` but
+   `Connection` never registered as a handler, so recv completions were never
+   delivered to `Connection.DeliverRecv()`.
+
+3. `Connection.Send()` assumed the caller would provide a pre-registered buffer
+   via `msg.Buffer`, but the benchmark caller passed `&Message{Length: N}` with
+   `Buffer == nil` — producing a 0-byte SGE list.
+
+4. `Connection.Send()` built a `SendWR` without `IBV_SEND_SIGNALED`, so the send
+   queue filled after `max_send_wr` posts with no way to reap completions.
+
+5. Mock testing masked all of these: `PostSend()` → no-op, `PostRecv()` → no-op,
+   `PollCQ()` → returns whatever the test injects. The test suite proved each
+   module's internal logic was correct but could not prove data would flow
+   end-to-end.
+
+The Phase 3 "Integration Layer" integrated **lifecycle** (server start/stop, accept/
+connect, message aggregation) but not the **data path** (post recv → poll CQ → deliver
+message → repost buffer).
+
+### 14.4 Resolution: PingPongConn
+
+The data path gap was resolved by introducing `PingPongConn` (`internal/rdma/
+pingpong.go`), a self-contained RDMA data path that performs all five operations
+in one struct:
+
+```go
+type PingPongConn struct {
+    qp     *C.struct_ibv_qp
+    pd     *C.struct_ibv_pd     // extracted from qp->pd
+    sendCQ *C.struct_ibv_cq     // extracted from qp->send_cq
+    recvCQ *C.struct_ibv_cq     // extracted from qp->recv_cq
+    sendBuf, recvBuf unsafe.Pointer  // C.malloc'd
+    sendMR, recvMR *C.struct_ibv_mr  // ibv_reg_mr'd
+    bufSize int
+}
+```
+
+`NewPingPongFromQP(qp, bufSize)` takes a CM-established QP and performs:
+1. Extract PD and CQs from the QP's C struct
+2. `C.malloc` + `memset` for send and recv buffers
+3. `ibv_reg_mr` for both buffers
+4. `postRecv()` to pre-post the first recv WR
+
+`Send()` posts a signaled send WR and busy-polls the send CQ inline.
+`Recv()` busy-polls the recv CQ and re-posts the recv WR after each completion.
+
+This is intentionally simple — one send buffer, one recv buffer, synchronous
+send/recv with inline polling. It bypasses the buffer pool, CQ poller, and
+connection manager abstractions entirely. The purpose is to provide a known-working
+data path for validation and benchmarking while the full modular integration is
+completed.
+
+### 14.5 Design Rules for Data Path Integration
+
+The following rules should govern future integration of the modular data path
+(buffer pool ↔ CQ poller ↔ connection manager):
+
+**Rule 1: Recv WRs must be posted before the connection is advertised as usable.**
+
+Connection establishment (both client `Connect()` and server `Accept()`) must call
+`RecvBufferPool.PostRecvBuffers(qp, queueDepth)` before transitioning to
+`StateConnected`. A QP in RTS state without posted recv WRs will cause RNR NAK on
+the first incoming send.
+
+**Rule 2: Every send must be signaled, or signaling must be explicitly managed.**
+
+The simplest correct approach: set `IBV_SEND_SIGNALED` on every send and poll the
+send CQ after each post. For higher throughput, signal every Nth send (where
+N < max_send_wr) and poll the send CQ to reap at least one completion before the
+queue fills. The aggregation engine's `ongoingSend` counter must track in-flight
+sends and block when approaching `max_send_wr`.
+
+**Rule 3: CQ polling must be wired before any sends or recvs.**
+
+The `CQPoller.Start()` goroutine must be running and the connection's CQ must be
+registered with it before the first send or recv WR is posted. Otherwise completions
+pile up unreported and the SQ/RQ exhaust.
+
+**Rule 4: Buffer lifecycle must be closed-loop.**
+
+```
+AcquireForSend() → copy → PostSend → [CQ completion] → CompleteSend() → back to pool
+PostRecvBuffers() → [CQ completion] → deliver to app → Replenish() → back to pool
+```
+
+Any break in this loop leaks buffers. The buffer monitor (Section 10.2) provides a
+safety net but should not be the primary mechanism.
+
+**Rule 5: Integration must be tested with real verbs, not only mocks.**
+
+Mock tests verify logic. Real verbs (even SoftRoCE/rxe) verify the data path.
+The minimum integration test is:
+
+```
+server.Listen() → client.Connect() → client.Send("hello") → server.Recv() == "hello"
+```
+
+This single test exercises all five required operations. If it passes on rxe, the
+data path is wired correctly. If it fails, one of the five operations is missing.
+
+### 14.6 Current State
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| CM connection setup (`Dial`/`AcceptConn`) | Working | Creates PD/CQs from CM context, QP reaches RTS |
+| PingPongConn data path | Working | Self-contained send/recv with buffer reg, recv posting, CQ polling |
+| Modular data path (buffer pool ↔ CQ ↔ connection) | Not wired | Interfaces exist, implementations exist, integration code does not |
+| `RecvBufferPool.PostRecvBuffers()` | Implemented, unused | Never called in connection setup |
+| `CompletionHandler` → `DeliverRecv()` bridge | Not implemented | Connection does not register with CQPoller |
+| End-to-end integration test (rxe) | Not yet | Blocked on modular data path wiring |
 
 ---
 
