@@ -20,5 +20,15 @@ func initVerbs(deviceName string) (api.Verbs, api.ProtectionDomain, error) {
 		}
 		deviceName = names[0]
 	}
-	return nil, nil, fmt.Errorf("real RDMA verbs adapter not yet wired for device %s", deviceName)
+
+	v := rdma.NewRealVerbs()
+	if err := v.OpenDevice(deviceName); err != nil {
+		return nil, nil, fmt.Errorf("opening device %s: %w", deviceName, err)
+	}
+	pd, err := v.AllocPD()
+	if err != nil {
+		v.Close()
+		return nil, nil, fmt.Errorf("allocating PD on %s: %w", deviceName, err)
+	}
+	return v, pd, nil
 }

@@ -30,6 +30,11 @@ static inline uint32_t golinker_wc_imm_data(const struct ibv_wc *wc) {
     return wc->imm_data;
 }
 
+// Setter for ibv_send_wr.imm_data (also in an anonymous union).
+static inline void golinker_wr_set_imm_data(struct ibv_send_wr *wr, uint32_t imm) {
+    wr->imm_data = imm;
+}
+
 // Poll CQ for completions AND re-post previous batch receive buffers in one CGo call.
 // Returns number of completions (>=0), or negative errno on failure.
 int golinker_poll_and_repost(struct ibv_cq *cq, struct ibv_wc *wcs, int max_wcs,
