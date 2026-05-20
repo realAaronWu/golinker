@@ -35,6 +35,34 @@ static inline int golinker_repost_recv_single(struct ibv_qp *qp, void *buf,
 }
 
 /*
+ * golinker_post_recv_one - Post a single receive work request.
+ *
+ * Returns:
+ *   0     : success
+ *   > 0   : errno from ibv_post_recv
+ */
+int golinker_post_recv_one(struct ibv_qp *qp, void *buf, uint32_t size,
+                           struct ibv_mr *mr, uint64_t wr_id)
+{
+    struct ibv_sge sge;
+    struct ibv_recv_wr wr;
+    struct ibv_recv_wr *bad_wr = NULL;
+
+    memset(&sge, 0, sizeof(sge));
+    sge.addr   = (uintptr_t)buf;
+    sge.length = size;
+    sge.lkey   = mr->lkey;
+
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id   = wr_id;
+    wr.next    = NULL;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    return ibv_post_recv(qp, &wr, &bad_wr);
+}
+
+/*
  * golinker_poll_and_repost - Combined poll + repost to minimize CGo crossings.
  *
  * Strategy:

@@ -35,6 +35,10 @@ static inline void golinker_wr_set_imm_data(struct ibv_send_wr *wr, uint32_t imm
     wr->imm_data = imm;
 }
 
+// Post a single receive work request. Returns 0 on success, errno on failure.
+int golinker_post_recv_one(struct ibv_qp *qp, void *buf, uint32_t size,
+                           struct ibv_mr *mr, uint64_t wr_id);
+
 // Poll CQ for completions AND re-post previous batch receive buffers in one CGo call.
 // Returns number of completions (>=0), or negative errno on failure.
 int golinker_poll_and_repost(struct ibv_cq *cq, struct ibv_wc *wcs, int max_wcs,

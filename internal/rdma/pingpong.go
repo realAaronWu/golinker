@@ -106,20 +106,9 @@ func NewPingPongFromQP(qp api.QueuePair, bufSize int) (*PingPongConn, error) {
 }
 
 // postRecv posts a single recv WR using the recv buffer.
+// Uses the C helper to avoid CGo pointer-in-pointer violations.
 func (p *PingPongConn) postRecv() error {
-	var sge C.struct_ibv_sge
-	sge.addr = C.uint64_t(uintptr(p.recvBuf))
-	sge.length = C.uint32_t(p.bufSize)
-	sge.lkey = p.recvMR.lkey
-
-	var wr C.struct_ibv_recv_wr
-	wr.wr_id = 0
-	wr.next = nil
-	wr.sg_list = &sge
-	wr.num_sge = 1
-
-	var badWR *C.struct_ibv_recv_wr
-	ret := C.ibv_post_recv(p.qp, &wr, &badWR)
+	ret := C.golinker_post_recv_one(p.qp, p.recvBuf, C.uint32_t(p.bufSize), p.recvMR, 0)
 	if ret != 0 {
 		return fmt.Errorf("ibv_post_recv failed: %d", ret)
 	}
@@ -128,6 +117,7 @@ func (p *PingPongConn) postRecv() error {
 
 // Send copies data into the send buffer and posts a signaled send WR.
 // It busy-polls the send CQ until the send completes.
+// Uses golinker_post_send_single C helper to avoid CGo pointer violations.
 func (p *PingPongConn) Send(data []byte) error {
 	length := len(data)
 	if length > p.bufSize {
@@ -137,41 +127,13 @@ func (p *PingPongConn) Send(data []byte) error {
 		C.memcpy(p.sendBuf, unsafe.Pointer(&data[0]), C.size_t(length))
 	}
 
-	var sge C.struct_ibv_sge
-	sge.addr = C.uint64_t(uintptr(p.sendBuf))
-	sge.length = C.uint32_t(length)
-	sge.lkey = p.sendMR.lkey
-
-	var wr C.struct_ibv_send_wr
-	wr.wr_id = 1
-	wr.next = nil
-	wr.sg_list = &sge
-	wr.num_sge = 1
-	wr.opcode = C.IBV_WR_SEND
-	wr.send_flags = C.uint(C.IBV_SEND_SIGNALED)
-
-	var badWR *C.struct_ibv_send_wr
-	ret := C.ibv_post_send(p.qp, &wr, &badWR)
+	ret := C.golinker_post_send_single(p.qp, p.sendBuf, C.uint32_t(length),
+		p.sendMR, 1, C.IBV_SEND_SIGNALED)
 	if ret != 0 {
 		return fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
 
-	// Busy-poll send CQ until completion.
-	var wc C.struct_ibv_wc
-	for {
-		n := C.golinker_poll_cq(p.sendCQ, &wc)
-		if n < 0 {
-			return fmt.Errorf("ibv_poll_cq (send) failed: %d", n)
-		}
-		if n > 0 {
-			if wc.status != C.IBV_WC_SUCCESS {
-				return fmt.Errorf("send completion error: status=%d vendor_err=%d",
-					wc.status, wc.vendor_err)
-			}
-			return nil
-		}
-		// n == 0: no completion yet, keep polling.
-	}
+	return p.pollSendCQ()
 }
 
 // Recv busy-polls the recv CQ until a message arrives. Returns the
@@ -208,31 +170,24 @@ func (p *PingPongConn) Recv(dst []byte) (int, error) {
 }
 
 // SendRaw sends the content already in the send buffer (no copy).
-// Useful for echo: recv into recvBuf, swap buffers, send.
+// Useful for echo: recv into recvBuf, CopyRecvToSend, then SendRaw.
+// Uses golinker_post_send_single C helper to avoid CGo pointer violations.
 func (p *PingPongConn) SendRaw(length int) error {
 	if length > p.bufSize {
 		length = p.bufSize
 	}
 
-	var sge C.struct_ibv_sge
-	sge.addr = C.uint64_t(uintptr(p.sendBuf))
-	sge.length = C.uint32_t(length)
-	sge.lkey = p.sendMR.lkey
-
-	var wr C.struct_ibv_send_wr
-	wr.wr_id = 1
-	wr.next = nil
-	wr.sg_list = &sge
-	wr.num_sge = 1
-	wr.opcode = C.IBV_WR_SEND
-	wr.send_flags = C.uint(C.IBV_SEND_SIGNALED)
-
-	var badWR *C.struct_ibv_send_wr
-	ret := C.ibv_post_send(p.qp, &wr, &badWR)
+	ret := C.golinker_post_send_single(p.qp, p.sendBuf, C.uint32_t(length),
+		p.sendMR, 1, C.IBV_SEND_SIGNALED)
 	if ret != 0 {
 		return fmt.Errorf("ibv_post_send failed: %d", ret)
 	}
 
+	return p.pollSendCQ()
+}
+
+// pollSendCQ busy-polls the send CQ until one completion arrives.
+func (p *PingPongConn) pollSendCQ() error {
 	var wc C.struct_ibv_wc
 	for {
 		n := C.golinker_poll_cq(p.sendCQ, &wc)
