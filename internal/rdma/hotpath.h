@@ -53,4 +53,13 @@ int golinker_batch_post_send(send_item_t *items, int count);
 int golinker_post_send_single(struct ibv_qp *qp, void *buf, uint32_t size,
                            struct ibv_mr *mr, uint64_t wr_id, int flags);
 
+// Wait for a CM event with a timeout (milliseconds).
+// Returns:
+//   0  : event received (stored in *event)
+//   1  : timeout (no event within timeout_ms)
+//  -1  : error (poll or rdma_get_cm_event failed)
+int golinker_get_cm_event_timeout(struct rdma_event_channel *ch,
+                                  struct rdma_cm_event **event,
+                                  int timeout_ms);
+
 #endif // GOLINKER_HOTPATH_H

@@ -14,10 +14,33 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"log"
 	"unsafe"
 
 	"github.com/wua20/golinker/api"
 )
+
+// getCMEvent waits for a CM event on ch, respecting the Go context.
+// It polls with 500ms intervals so context cancellation is detected promptly.
+// Returns the raw C event (caller must ack) or an error.
+func getCMEvent(ctx context.Context, ch *C.struct_rdma_event_channel) (*C.struct_rdma_cm_event, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("context cancelled waiting for CM event: %w", err)
+		}
+		var event *C.struct_rdma_cm_event
+		ret := C.golinker_get_cm_event_timeout(ch, &event, 500) // 500ms poll
+		switch ret {
+		case 0:
+			return event, nil
+		case 1:
+			// timeout — check context and retry
+			continue
+		default:
+			return nil, fmt.Errorf("golinker_get_cm_event_timeout failed: %d", ret)
+		}
+	}
+}
 
 // ---------------------------------------------------------------------------
 // RealCMEventChannel – implements api.CMEventChannel + api.CMAcceptor
@@ -73,13 +96,11 @@ func (r *RealCMEventChannel) Listen(ctx context.Context, addr string, port int) 
 
 // GetEvent waits for the next CM event from the event channel.
 // The returned event's Opaque field holds the raw C event for deferred ack.
-// NOTE: Uses C.rdma_get_cm_event directly instead of the Go GetCMEvent wrapper
-// because the wrapper auto-acks the event.
+// Respects context cancellation via poll-based waiting.
 func (r *RealCMEventChannel) GetEvent(ctx context.Context) (*api.CMEvent, error) {
-	var event *C.struct_rdma_cm_event
-	ret := C.rdma_get_cm_event(r.ch, &event)
-	if ret != 0 {
-		return nil, fmt.Errorf("rdma_get_cm_event failed: %d", ret)
+	event, err := getCMEvent(ctx, r.ch)
+	if err != nil {
+		return nil, err
 	}
 
 	evType := api.CMEventType(mapCMEventType(event.event))
@@ -204,10 +225,11 @@ type RealCMDialer struct {
 
 // Dial performs the full RDMA CM connection handshake:
 // resolve-addr -> create PD/CQs from CM context -> resolve-route -> create-QP -> connect.
+// Respects context cancellation at every blocking step.
 // Note: the pd, sendCQ, recvCQ parameters are ignored for real RDMA because
 // rdma_create_qp requires resources from the CM ID's own ibv_context.
 func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.ProtectionDomain, sendCQ, recvCQ api.CompletionQueue, cfg api.QueuePairConfig) (api.QueuePair, unsafe.Pointer, error) {
-	debugf("Dial: target=%s:%d", addr, port)
+	log.Printf("[rdma] Dial: target=%s:%d", addr, port)
 
 	ch, err := CreateEventChannel()
 	if err != nil {
@@ -221,33 +243,32 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	}
 
 	// Step 1: Resolve address.
-	debugf("Dial: resolving address %s:%d", addr, port)
+	log.Printf("[rdma] Dial: resolving address %s:%d (timeout 2s)", addr, port)
 	if err := ResolveAddr(id, addr, port, 2000); err != nil {
 		DestroyID(id)
 		DestroyEventChannel(ch)
 		return nil, nil, fmt.Errorf("resolve addr: %w", err)
 	}
 
-	// Wait for ADDR_RESOLVED.
-	var event *C.struct_rdma_cm_event
-	ret := C.rdma_get_cm_event(ch, &event)
-	if ret != 0 {
+	// Wait for ADDR_RESOLVED (context-aware).
+	event, err := getCMEvent(ctx, ch)
+	if err != nil {
 		DestroyID(id)
 		DestroyEventChannel(ch)
-		return nil, nil, fmt.Errorf("rdma_get_cm_event (addr): %d", ret)
+		return nil, nil, fmt.Errorf("waiting for ADDR_RESOLVED: %w", err)
 	}
 	if mapCMEventType(event.event) != CMEventAddrResolved {
+		evNum := int(event.event)
 		C.rdma_ack_cm_event(event)
 		DestroyID(id)
 		DestroyEventChannel(ch)
-		return nil, nil, fmt.Errorf("unexpected event: wanted ADDR_RESOLVED, got %d", event.event)
+		return nil, nil, fmt.Errorf("expected ADDR_RESOLVED, got event %d", evNum)
 	}
 	C.rdma_ack_cm_event(event)
+	log.Printf("[rdma] Dial: ADDR_RESOLVED")
 
 	// Step 2: Create PD and CQs from the CM ID's verbs context.
-	debugf("Dial: ADDR_RESOLVED, creating PD/CQs from verbs=%p", id.verbs)
-	// After addr resolution, id->verbs is set. All QP resources must come
-	// from this context; using a separately-opened ibv_context will fail.
+	debugf("Dial: creating PD/CQs from verbs=%p", id.verbs)
 	cmPD := C.ibv_alloc_pd(id.verbs)
 	if cmPD == nil {
 		DestroyID(id)
@@ -281,7 +302,7 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	}
 
 	// Step 3: Resolve route.
-	debugf("Dial: resolving route")
+	log.Printf("[rdma] Dial: resolving route (timeout 2s)")
 	if err := ResolveRoute(id, 2000); err != nil {
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
@@ -291,29 +312,30 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 		return nil, nil, fmt.Errorf("resolve route: %w", err)
 	}
 
-	// Wait for ROUTE_RESOLVED.
-	ret = C.rdma_get_cm_event(ch, &event)
-	if ret != 0 {
+	// Wait for ROUTE_RESOLVED (context-aware).
+	event, err = getCMEvent(ctx, ch)
+	if err != nil {
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
 		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
-		return nil, nil, fmt.Errorf("rdma_get_cm_event (route): %d", ret)
+		return nil, nil, fmt.Errorf("waiting for ROUTE_RESOLVED: %w", err)
 	}
 	if mapCMEventType(event.event) != CMEventRouteResolved {
+		evNum := int(event.event)
 		C.rdma_ack_cm_event(event)
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
 		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
-		return nil, nil, fmt.Errorf("unexpected event: wanted ROUTE_RESOLVED, got %d", event.event)
+		return nil, nil, fmt.Errorf("expected ROUTE_RESOLVED, got event %d", evNum)
 	}
 	C.rdma_ack_cm_event(event)
+	log.Printf("[rdma] Dial: ROUTE_RESOLVED")
 
 	// Step 4: Create QP on the CM ID using CM-context PD and CQs.
-	debugf("Dial: ROUTE_RESOLVED, creating QP")
 	qpCfg := QPConfig{
 		MaxSendWR:     cfg.MaxSendWR,
 		MaxRecvWR:     cfg.MaxRecvWR,
@@ -330,9 +352,9 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 		DestroyEventChannel(ch)
 		return nil, nil, fmt.Errorf("create qp: %w", err)
 	}
+	log.Printf("[rdma] Dial: QP created (qp_num=%d), connecting", id.qp.qp_num)
 
 	// Step 5: Connect.
-	debugf("Dial: QP created (qp_num=%d), connecting", id.qp.qp_num)
 	if err := Connect(id, nil); err != nil {
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
@@ -342,28 +364,29 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 		return nil, nil, fmt.Errorf("connect: %w", err)
 	}
 
-	// Wait for ESTABLISHED.
-	ret = C.rdma_get_cm_event(ch, &event)
-	if ret != 0 {
+	// Wait for ESTABLISHED (context-aware).
+	event, err = getCMEvent(ctx, ch)
+	if err != nil {
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
 		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
-		return nil, nil, fmt.Errorf("rdma_get_cm_event (established): %d", ret)
+		return nil, nil, fmt.Errorf("waiting for ESTABLISHED: %w", err)
 	}
 	if mapCMEventType(event.event) != CMEventEstablished {
+		evNum := int(event.event)
 		C.rdma_ack_cm_event(event)
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
 		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
-		return nil, nil, fmt.Errorf("unexpected event: wanted ESTABLISHED, got %d", event.event)
+		return nil, nil, fmt.Errorf("expected ESTABLISHED, got event %d", evNum)
 	}
 	C.rdma_ack_cm_event(event)
 
-	debugf("Dial: ESTABLISHED, connection ready (qp_num=%d)", id.qp.qp_num)
+	log.Printf("[rdma] Dial: ESTABLISHED (qp_num=%d)", id.qp.qp_num)
 
 	// Track for cleanup in Close().
 	d.channels = append(d.channels, ch)

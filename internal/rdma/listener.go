@@ -12,6 +12,7 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"unsafe"
@@ -56,7 +57,7 @@ func Listen(addr string, cfg Config) (*Listener, error) {
 		return nil, fmt.Errorf("CM listen %s:%d: %w", host, port, err)
 	}
 
-	debugf("Listener: ready on %s", addr)
+	log.Printf("[rdma] Listener: ready on %s", addr)
 	return &Listener{ch: ch, cfg: cfg, pending: make(map[uintptr]api.QueuePair)}, nil
 }
 
@@ -64,6 +65,7 @@ func Listen(addr string, cfg Config) (*Listener, error) {
 // a ready-to-use *Conn. It handles the CM event state machine internally:
 // CONNECT_REQUEST → AcceptConn → ESTABLISHED → PingPongConn.
 func (ln *Listener) Accept(ctx context.Context) (*Conn, error) {
+	log.Printf("[rdma] Accept: waiting for connections...")
 	for {
 		event, err := ln.ch.GetEvent(ctx)
 		if err != nil {
@@ -72,6 +74,7 @@ func (ln *Listener) Accept(ctx context.Context) (*Conn, error) {
 
 		switch event.Type {
 		case api.EventConnectRequest:
+			log.Printf("[rdma] Accept: CONNECT_REQUEST received")
 			qp, err := ln.ch.AcceptConn(event.ID, nil, nil, nil, api.QueuePairConfig{
 				MaxSendWR:  ln.cfg.QueueDepth,
 				MaxRecvWR:  ln.cfg.QueueDepth,
@@ -80,20 +83,20 @@ func (ln *Listener) Accept(ctx context.Context) (*Conn, error) {
 			})
 			if err != nil {
 				ln.ch.AckEvent(event)
-				debugf("Listener.Accept: AcceptConn failed: %v", err)
+				log.Printf("[rdma] Accept: AcceptConn FAILED: %v", err)
 				continue
 			}
 			key := uintptr(event.ID)
 			ln.pending[key] = qp
 			ln.ch.AckEvent(event)
-			debugf("Listener.Accept: CONNECT_REQUEST accepted, waiting ESTABLISHED")
+			log.Printf("[rdma] Accept: AcceptConn done, waiting for ESTABLISHED")
 
 		case api.EventEstablished:
 			key := uintptr(event.ID)
 			ln.ch.AckEvent(event)
 			qp, ok := ln.pending[key]
 			if !ok {
-				debugf("Listener.Accept: ESTABLISHED for unknown CM ID %v", event.ID)
+				log.Printf("[rdma] Accept: ESTABLISHED for unknown CM ID %v (ignoring)", event.ID)
 				continue
 			}
 			delete(ln.pending, key)
@@ -114,11 +117,11 @@ func (ln *Listener) Accept(ctx context.Context) (*Conn, error) {
 					}
 				},
 			}
-			debugf("Listener.Accept: connection ready")
+			log.Printf("[rdma] Accept: ESTABLISHED, connection ready")
 			return conn, nil
 
 		default:
-			debugf("Listener.Accept: ignoring event type=%d", event.Type)
+			log.Printf("[rdma] Accept: unexpected event type=%d (ignoring)", event.Type)
 			ln.ch.AckEvent(event)
 		}
 	}

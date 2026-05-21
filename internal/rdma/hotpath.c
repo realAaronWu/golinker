@@ -3,6 +3,7 @@
 #include "hotpath.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <string.h>
 
 /* Maximum batch size for stack-allocated work request arrays. */
@@ -199,4 +200,43 @@ int golinker_post_send_single(struct ibv_qp *qp, void *buf, uint32_t size,
 
     ret = ibv_post_send(qp, &wr, &bad_wr);
     return ret;
+}
+
+/*
+ * golinker_get_cm_event_timeout - Wait for a CM event with a timeout.
+ *
+ * Uses poll() on the event channel FD so the caller can implement
+ * context-aware cancellation by calling with short timeouts in a loop.
+ *
+ * Returns:
+ *   0  : event received (*event is set)
+ *   1  : timeout (no event within timeout_ms)
+ *  -1  : error (errno is set)
+ */
+int golinker_get_cm_event_timeout(struct rdma_event_channel *ch,
+                                  struct rdma_cm_event **event,
+                                  int timeout_ms)
+{
+    struct pollfd pfd;
+    int ret;
+
+    pfd.fd = ch->fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    ret = poll(&pfd, 1, timeout_ms);
+    if (ret == 0) {
+        return 1;   /* timeout */
+    }
+    if (ret < 0) {
+        return -1;  /* poll error */
+    }
+
+    /* FD is readable; rdma_get_cm_event should return immediately. */
+    ret = rdma_get_cm_event(ch, event);
+    if (ret != 0) {
+        return -1;
+    }
+
+    return 0;
 }
