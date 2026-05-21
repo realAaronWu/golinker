@@ -130,12 +130,14 @@ func ResolveRoute(id *C.struct_rdma_cm_id, timeoutMs int) error {
 }
 
 // Connect initiates an RDMA connection with optional private data.
+// retry_count=3 gives ~30s total CM timeout (vs 7→~500s).
 func Connect(id *C.struct_rdma_cm_id, privateData []byte) error {
 	var params C.struct_rdma_conn_param
 	C.memset(unsafe.Pointer(&params), 0, C.size_t(unsafe.Sizeof(params)))
 	params.initiator_depth = 1
 	params.responder_resources = 1
-	params.retry_count = 7
+	params.retry_count = 3
+	params.rnr_retry_count = 7
 
 	if len(privateData) > 0 {
 		params.private_data = unsafe.Pointer(&privateData[0])
