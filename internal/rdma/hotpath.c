@@ -227,17 +227,35 @@ int golinker_get_cm_event_timeout(struct rdma_event_channel *ch,
     pfd.events = POLLIN;
     pfd.revents = 0;
 
+retry_poll:
     ret = poll(&pfd, 1, timeout_ms);
     if (ret == 0) {
         return 1;   /* timeout */
     }
     if (ret < 0) {
+        if (errno == EINTR) {
+            goto retry_poll;  /* signal interrupted, retry */
+        }
+        fprintf(stderr, "[rdma-diag] poll() failed: errno=%d (%s), fd=%d, revents=0x%x\n",
+                errno, strerror(errno), ch->fd, pfd.revents);
         return -1;  /* poll error */
+    }
+
+    /* Check for error conditions on the FD. */
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        fprintf(stderr, "[rdma-diag] poll() revents=0x%x (ERR=%d HUP=%d NVAL=%d) fd=%d\n",
+                pfd.revents,
+                !!(pfd.revents & POLLERR),
+                !!(pfd.revents & POLLHUP),
+                !!(pfd.revents & POLLNVAL),
+                ch->fd);
     }
 
     /* FD is readable; rdma_get_cm_event should return immediately. */
     ret = rdma_get_cm_event(ch, event);
     if (ret != 0) {
+        fprintf(stderr, "[rdma-diag] rdma_get_cm_event failed: errno=%d (%s)\n",
+                errno, strerror(errno));
         return -1;
     }
 

@@ -60,6 +60,7 @@ func main() {
 	rootCmd.AddCommand(newServerCmd())
 	rootCmd.AddCommand(newClientCmd())
 	rootCmd.AddCommand(newReportCmd())
+	rootCmd.AddCommand(newPingCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -89,6 +90,16 @@ func newClientCmd() *cobra.Command {
 	cmd.Flags().Int("rate", 0, "target send rate (0=unlimited)")
 	cmd.Flags().Bool("closed-loop", false, "use closed-loop sending")
 	cmd.Flags().Int("goroutines", 0, "sender goroutines (0=GOMAXPROCS)")
+	return cmd
+}
+
+func newPingCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "ping",
+		Short: "Test RDMA CM connectivity (connect, send, recv, disconnect)",
+		RunE:  executePing,
+	}
+	cmd.Flags().Int("timeout", 15, "connection timeout in seconds")
 	return cmd
 }
 
