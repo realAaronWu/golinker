@@ -30,6 +30,15 @@ const (
 	CMEventDisconnected
 	CMEventRejected
 	CMEventDeviceRemoval
+	CMEventAddrError
+	CMEventRouteError
+	CMEventConnectError
+	CMEventUnreachable
+	CMEventTimewaitExit
+	CMEventAddrChange
+	CMEventMulticastJoin
+	CMEventMulticastError
+	CMEventUnknown
 )
 
 // CreateEventChannel creates an RDMA CM event channel.
@@ -224,7 +233,28 @@ func mapCMEventType(ev C.enum_rdma_cm_event_type) CMEventType {
 		return CMEventRejected
 	case C.RDMA_CM_EVENT_DEVICE_REMOVAL:
 		return CMEventDeviceRemoval
+	case C.RDMA_CM_EVENT_ADDR_ERROR:
+		return CMEventAddrError
+	case C.RDMA_CM_EVENT_ROUTE_ERROR:
+		return CMEventRouteError
+	case C.RDMA_CM_EVENT_CONNECT_ERROR:
+		return CMEventConnectError
+	case C.RDMA_CM_EVENT_UNREACHABLE:
+		return CMEventUnreachable
+	case C.RDMA_CM_EVENT_TIMEWAIT_EXIT:
+		return CMEventTimewaitExit
+	case C.RDMA_CM_EVENT_ADDR_CHANGE:
+		return CMEventAddrChange
+	case C.RDMA_CM_EVENT_MULTICAST_JOIN:
+		return CMEventMulticastJoin
+	case C.RDMA_CM_EVENT_MULTICAST_ERROR:
+		return CMEventMulticastError
 	default:
-		return CMEventDisconnected
+		return CMEventUnknown
 	}
+}
+
+// cmEventName returns a human-readable name for a CM event type.
+func cmEventName(ev C.enum_rdma_cm_event_type) string {
+	return C.GoString(C.rdma_event_str(ev))
 }

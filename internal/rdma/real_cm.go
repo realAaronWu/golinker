@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 	"unsafe"
 
 	"github.com/wua20/golinker/api"
@@ -24,20 +25,28 @@ import (
 // It polls with 500ms intervals so context cancellation is detected promptly.
 // Returns the raw C event (caller must ack) or an error.
 func getCMEvent(ctx context.Context, ch *C.struct_rdma_event_channel) (*C.struct_rdma_cm_event, error) {
+	polls := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("context cancelled waiting for CM event: %w", err)
+			return nil, fmt.Errorf("context cancelled waiting for CM event (after %d polls): %w", polls, err)
 		}
 		var event *C.struct_rdma_cm_event
 		ret := C.golinker_get_cm_event_timeout(ch, &event, 500) // 500ms poll
+		polls++
 		switch ret {
 		case 0:
+			log.Printf("[rdma] getCMEvent: got event %q (raw=%d) after %d polls",
+				cmEventName(event.event), int(event.event), polls)
 			return event, nil
 		case 1:
-			// timeout — check context and retry
+			// timeout — log every 10s (20 polls)
+			if polls%20 == 0 {
+				log.Printf("[rdma] getCMEvent: still waiting (fd=%d, %d polls = %ds)",
+					ch.fd, polls, polls/2)
+			}
 			continue
 		default:
-			return nil, fmt.Errorf("golinker_get_cm_event_timeout failed: %d", ret)
+			return nil, fmt.Errorf("golinker_get_cm_event_timeout failed: %d (after %d polls)", ret, polls)
 		}
 	}
 }
@@ -81,7 +90,9 @@ func (r *RealCMEventChannel) Listen(ctx context.Context, addr string, port int) 
 		return fmt.Errorf("bind addr: %w", err)
 	}
 
-	C.golinker_dump_cm_id(id, C.CString("server-after-bind"))
+	labelBind := C.CString("server-after-bind")
+	C.golinker_dump_cm_id(id, labelBind)
+	C.free(unsafe.Pointer(labelBind))
 
 	debugf("Listen: starting listen (backlog=128)")
 	if err := cmListen(id, 128); err != nil {
@@ -228,9 +239,16 @@ type RealCMDialer struct {
 // Dial performs the full RDMA CM connection handshake:
 // resolve-addr -> create PD/CQs from CM context -> resolve-route -> create-QP -> connect.
 // Respects context cancellation at every blocking step.
+// If the context has no deadline, a 30s deadline is applied so Dial never hangs forever.
 // Note: the pd, sendCQ, recvCQ parameters are ignored for real RDMA because
 // rdma_create_qp requires resources from the CM ID's own ibv_context.
 func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.ProtectionDomain, sendCQ, recvCQ api.CompletionQueue, cfg api.QueuePairConfig) (api.QueuePair, unsafe.Pointer, error) {
+	// Apply a default 30s deadline if the caller didn't set one.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
 	log.Printf("[rdma] Dial: target=%s:%d", addr, port)
 
 	ch, err := CreateEventChannel()
@@ -260,15 +278,17 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 		return nil, nil, fmt.Errorf("waiting for ADDR_RESOLVED: %w", err)
 	}
 	if mapCMEventType(event.event) != CMEventAddrResolved {
-		evNum := int(event.event)
+		evName := cmEventName(event.event)
 		C.rdma_ack_cm_event(event)
 		DestroyID(id)
 		DestroyEventChannel(ch)
-		return nil, nil, fmt.Errorf("expected ADDR_RESOLVED, got event %d", evNum)
+		return nil, nil, fmt.Errorf("expected ADDR_RESOLVED, got %s", evName)
 	}
 	C.rdma_ack_cm_event(event)
 	log.Printf("[rdma] Dial: ADDR_RESOLVED")
-	C.golinker_dump_cm_id(id, C.CString("client-after-addr-resolved"))
+	label1 := C.CString("client-after-addr-resolved")
+	C.golinker_dump_cm_id(id, label1)
+	C.free(unsafe.Pointer(label1))
 
 	// Step 2: Create PD and CQs from the CM ID's verbs context.
 	debugf("Dial: creating PD/CQs from verbs=%p", id.verbs)
@@ -326,18 +346,20 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 		return nil, nil, fmt.Errorf("waiting for ROUTE_RESOLVED: %w", err)
 	}
 	if mapCMEventType(event.event) != CMEventRouteResolved {
-		evNum := int(event.event)
+		evName := cmEventName(event.event)
 		C.rdma_ack_cm_event(event)
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
 		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
-		return nil, nil, fmt.Errorf("expected ROUTE_RESOLVED, got event %d", evNum)
+		return nil, nil, fmt.Errorf("expected ROUTE_RESOLVED, got %s", evName)
 	}
 	C.rdma_ack_cm_event(event)
 	log.Printf("[rdma] Dial: ROUTE_RESOLVED")
-	C.golinker_dump_cm_id(id, C.CString("client-after-route-resolved"))
+	label2 := C.CString("client-after-route-resolved")
+	C.golinker_dump_cm_id(id, label2)
+	C.free(unsafe.Pointer(label2))
 
 	// Step 4: Create QP on the CM ID using CM-context PD and CQs.
 	qpCfg := QPConfig{
@@ -357,7 +379,9 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 		return nil, nil, fmt.Errorf("create qp: %w", err)
 	}
 	log.Printf("[rdma] Dial: QP created (qp_num=%d), connecting", id.qp.qp_num)
-	C.golinker_dump_cm_id(id, C.CString("client-before-connect"))
+	label3 := C.CString("client-before-connect")
+	C.golinker_dump_cm_id(id, label3)
+	C.free(unsafe.Pointer(label3))
 
 	// Step 5: Connect.
 	if err := Connect(id, nil); err != nil {
@@ -380,14 +404,14 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 		return nil, nil, fmt.Errorf("waiting for ESTABLISHED: %w", err)
 	}
 	if mapCMEventType(event.event) != CMEventEstablished {
-		evNum := int(event.event)
+		evName := cmEventName(event.event)
 		C.rdma_ack_cm_event(event)
 		C.ibv_destroy_cq(cmRecvCQ)
 		C.ibv_destroy_cq(cmSendCQ)
 		C.ibv_dealloc_pd(cmPD)
 		DestroyID(id)
 		DestroyEventChannel(ch)
-		return nil, nil, fmt.Errorf("expected ESTABLISHED, got event %d", evNum)
+		return nil, nil, fmt.Errorf("expected ESTABLISHED, got %s", evName)
 	}
 	C.rdma_ack_cm_event(event)
 
