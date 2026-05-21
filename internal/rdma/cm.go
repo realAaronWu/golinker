@@ -90,8 +90,8 @@ func BindAddr(id *C.struct_rdma_cm_id, addr string, port int) error {
 	return nil
 }
 
-// Listen starts listening for incoming connections on the given CM ID.
-func Listen(id *C.struct_rdma_cm_id, backlog int) error {
+// cmListen starts listening for incoming connections on the given CM ID.
+func cmListen(id *C.struct_rdma_cm_id, backlog int) error {
 	ret := C.rdma_listen(id, C.int(backlog))
 	if ret != 0 {
 		return fmt.Errorf("rdma_listen failed: %d", ret)

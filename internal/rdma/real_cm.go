@@ -59,7 +59,7 @@ func (r *RealCMEventChannel) Listen(ctx context.Context, addr string, port int) 
 	}
 
 	debugf("Listen: starting listen (backlog=128)")
-	if err := Listen(id, 128); err != nil {
+	if err := cmListen(id, 128); err != nil {
 		DestroyID(id)
 		DestroyEventChannel(ch)
 		r.listenID = nil
