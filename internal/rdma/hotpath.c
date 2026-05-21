@@ -4,7 +4,10 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 /* Maximum batch size for stack-allocated work request arrays. */
 #define GOLINKER_MAX_BATCH 32
@@ -239,4 +242,62 @@ int golinker_get_cm_event_timeout(struct rdma_event_channel *ch,
     }
 
     return 0;
+}
+
+/*
+ * golinker_dump_cm_id - Print diagnostic info for a CM ID.
+ */
+void golinker_dump_cm_id(struct rdma_cm_id *id, const char *label)
+{
+    char src_buf[INET6_ADDRSTRLEN] = "?";
+    char dst_buf[INET6_ADDRSTRLEN] = "?";
+    int src_port = 0, dst_port = 0;
+
+    if (!id) {
+        fprintf(stderr, "[rdma-diag] %s: CM ID is NULL\n", label);
+        return;
+    }
+
+    fprintf(stderr, "[rdma-diag] %s: cm_id=%p channel=%p (fd=%d)\n",
+            label, (void *)id, (void *)id->channel,
+            id->channel ? id->channel->fd : -1);
+
+    if (id->verbs) {
+        fprintf(stderr, "[rdma-diag] %s: device=%s port=%d\n",
+                label, id->verbs->device->name, id->port_num);
+    } else {
+        fprintf(stderr, "[rdma-diag] %s: verbs=NULL (not resolved yet)\n", label);
+    }
+
+    /* Source address */
+    struct sockaddr *sa = rdma_get_local_addr(id);
+    if (sa && sa->sa_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+        inet_ntop(AF_INET, &sin->sin_addr, src_buf, sizeof(src_buf));
+        src_port = ntohs(sin->sin_port);
+    } else if (sa && sa->sa_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, src_buf, sizeof(src_buf));
+        src_port = ntohs(sin6->sin6_port);
+    }
+
+    /* Destination address */
+    struct sockaddr *da = rdma_get_peer_addr(id);
+    if (da && da->sa_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)da;
+        inet_ntop(AF_INET, &sin->sin_addr, dst_buf, sizeof(dst_buf));
+        dst_port = ntohs(sin->sin_port);
+    } else if (da && da->sa_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)da;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, dst_buf, sizeof(dst_buf));
+        dst_port = ntohs(sin6->sin6_port);
+    }
+
+    fprintf(stderr, "[rdma-diag] %s: src=%s:%d dst=%s:%d\n",
+            label, src_buf, src_port, dst_buf, dst_port);
+
+    if (id->qp) {
+        fprintf(stderr, "[rdma-diag] %s: qp_num=%d qp_type=%d\n",
+                label, id->qp->qp_num, id->qp->qp_type);
+    }
 }

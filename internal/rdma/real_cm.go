@@ -81,6 +81,8 @@ func (r *RealCMEventChannel) Listen(ctx context.Context, addr string, port int) 
 		return fmt.Errorf("bind addr: %w", err)
 	}
 
+	C.golinker_dump_cm_id(id, C.CString("server-after-bind"))
+
 	debugf("Listen: starting listen (backlog=128)")
 	if err := cmListen(id, 128); err != nil {
 		DestroyID(id)
@@ -266,6 +268,7 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	}
 	C.rdma_ack_cm_event(event)
 	log.Printf("[rdma] Dial: ADDR_RESOLVED")
+	C.golinker_dump_cm_id(id, C.CString("client-after-addr-resolved"))
 
 	// Step 2: Create PD and CQs from the CM ID's verbs context.
 	debugf("Dial: creating PD/CQs from verbs=%p", id.verbs)
@@ -334,6 +337,7 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 	}
 	C.rdma_ack_cm_event(event)
 	log.Printf("[rdma] Dial: ROUTE_RESOLVED")
+	C.golinker_dump_cm_id(id, C.CString("client-after-route-resolved"))
 
 	// Step 4: Create QP on the CM ID using CM-context PD and CQs.
 	qpCfg := QPConfig{
@@ -353,6 +357,7 @@ func (d *RealCMDialer) Dial(ctx context.Context, addr string, port int, pd api.P
 		return nil, nil, fmt.Errorf("create qp: %w", err)
 	}
 	log.Printf("[rdma] Dial: QP created (qp_num=%d), connecting", id.qp.qp_num)
+	C.golinker_dump_cm_id(id, C.CString("client-before-connect"))
 
 	// Step 5: Connect.
 	if err := Connect(id, nil); err != nil {

@@ -62,4 +62,7 @@ int golinker_get_cm_event_timeout(struct rdma_event_channel *ch,
                                   struct rdma_cm_event **event,
                                   int timeout_ms);
 
+// Dump CM ID diagnostic info to stderr: device name, port, src/dst addresses.
+void golinker_dump_cm_id(struct rdma_cm_id *id, const char *label);
+
 #endif // GOLINKER_HOTPATH_H
