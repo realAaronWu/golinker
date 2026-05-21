@@ -65,6 +65,17 @@ func (sp *SendPool) CompleteSend(buf *api.Buffer) {
 	sp.pool.Free(buf)
 }
 
+// IsBusy returns true when the pool is under pressure (>= 50% of buffers in-flight).
+// This signal drives the aggregation layer to switch from immediate to batched sends.
+func (sp *SendPool) IsBusy() bool {
+	inFlight := atomic.LoadInt64(&sp.inFlightN)
+	threshold := int64(sp.pool.cfg.BufferCount / 2)
+	if threshold < 1 {
+		threshold = 1
+	}
+	return inFlight >= threshold
+}
+
 // IsInFlight checks if a buffer is currently in-flight (for testing).
 func (sp *SendPool) IsInFlight(buf *api.Buffer) bool {
 	_, ok := sp.inFlight.Load(unsafeAddr(buf.Addr))

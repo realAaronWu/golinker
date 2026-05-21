@@ -90,7 +90,7 @@ func (a *Aggregator) immediateSend(data []byte) error {
 		return err
 	}
 
-	totalNeeded := BatchHeaderSize + MsgHeaderSize + len(data)
+	totalNeeded := CmdHeaderSize + AppHeaderSize + len(data)
 	if totalNeeded > buf.Length {
 		a.sendPool.CompleteSend(buf)
 		return ErrBufferTooSmall
@@ -113,11 +113,11 @@ func (a *Aggregator) immediateSend(data []byte) error {
 func (a *Aggregator) aggregateSend(data []byte) error {
 	a.mu.Lock()
 
-	msgFramedSize := MsgHeaderSize + len(data)
+	msgFramedSize := AppHeaderSize + len(data)
 
 	// Overflow trigger: if adding this message would exceed buffer capacity,
 	// flush existing pending messages first.
-	currentBatchSize := BatchHeaderSize + a.pendingSize
+	currentBatchSize := CmdHeaderSize + a.pendingSize
 	if a.pendingSize > 0 && currentBatchSize+msgFramedSize > a.bufferSize {
 		if err := a.flushLocked(); err != nil {
 			a.mu.Unlock()
@@ -131,8 +131,8 @@ func (a *Aggregator) aggregateSend(data []byte) error {
 	a.pending = append(a.pending, dataCopy)
 	a.pendingSize += msgFramedSize
 
-	// Threshold trigger: pendingSize + BatchHeaderSize > sendThreshold
-	if BatchHeaderSize+a.pendingSize > a.sendThreshold {
+	// Threshold trigger: pendingSize + CmdHeaderSize > sendThreshold
+	if CmdHeaderSize+a.pendingSize > a.sendThreshold {
 		err := a.flushLocked()
 		a.mu.Unlock()
 		return err
@@ -172,7 +172,7 @@ func (a *Aggregator) flushLocked() error {
 		// Put messages back on failure
 		a.pending = messages
 		for _, m := range messages {
-			a.pendingSize += MsgHeaderSize + len(m)
+			a.pendingSize += AppHeaderSize + len(m)
 		}
 		return err
 	}

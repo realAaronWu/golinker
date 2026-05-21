@@ -28,7 +28,7 @@ func (s *ImmediateSender) Send(data []byte) error {
 	}
 
 	// Pack the message into the buffer as a single-message batch
-	totalNeeded := BatchHeaderSize + MsgHeaderSize + len(data)
+	totalNeeded := CmdHeaderSize + AppHeaderSize + len(data)
 	if totalNeeded > buf.Length {
 		s.sendPool.CompleteSend(buf)
 		return ErrBufferTooSmall

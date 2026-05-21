@@ -555,3 +555,131 @@ func TestPollerClose(t *testing.T) {
 	}
 	_ = poller2.Close()
 }
+
+// --- SendCompletionHandler Tests ---
+
+type mockSendPool struct {
+	mu        sync.Mutex
+	completed []*api.Buffer
+}
+
+func (p *mockSendPool) Alloc(size int) (*api.Buffer, error) {
+	data := make([]byte, size)
+	return &api.Buffer{Addr: unsafe.Pointer(&data[0]), Length: size}, nil
+}
+func (p *mockSendPool) Free(buf *api.Buffer)         {}
+func (p *mockSendPool) Stats() api.BufferPoolStats    { return api.BufferPoolStats{} }
+func (p *mockSendPool) Close() error                  { return nil }
+func (p *mockSendPool) AcquireForSend() (*api.Buffer, error) { return p.Alloc(4096) }
+func (p *mockSendPool) CompleteSend(buf *api.Buffer) {
+	p.mu.Lock()
+	p.completed = append(p.completed, buf)
+	p.mu.Unlock()
+}
+
+func TestSendCompletionHandlerBasic(t *testing.T) {
+	pool := &mockSendPool{}
+	callbackCount := atomic.Int32{}
+	h := NewSendCompletionHandler(pool, func() { callbackCount.Add(1) })
+
+	// Track a send
+	data := make([]byte, 64)
+	buf := &api.Buffer{Addr: unsafe.Pointer(&data[0]), Length: 64}
+	h.TrackSend(1, buf)
+
+	if h.InFlight() != 1 {
+		t.Fatalf("expected 1 in-flight, got %d", h.InFlight())
+	}
+
+	// Simulate completion
+	h.OnCompletion(&api.WorkCompletion{WRID: 1, Status: api.WCSuccess})
+
+	if h.InFlight() != 0 {
+		t.Fatalf("expected 0 in-flight after completion, got %d", h.InFlight())
+	}
+
+	pool.mu.Lock()
+	if len(pool.completed) != 1 {
+		t.Fatalf("expected 1 CompleteSend call, got %d", len(pool.completed))
+	}
+	if pool.completed[0] != buf {
+		t.Fatal("CompleteSend called with wrong buffer")
+	}
+	pool.mu.Unlock()
+
+	if callbackCount.Load() != 1 {
+		t.Fatalf("expected onComplete callback called once, got %d", callbackCount.Load())
+	}
+}
+
+func TestSendCompletionHandlerError(t *testing.T) {
+	pool := &mockSendPool{}
+	h := NewSendCompletionHandler(pool, nil)
+
+	data := make([]byte, 64)
+	buf := &api.Buffer{Addr: unsafe.Pointer(&data[0]), Length: 64}
+	h.TrackSend(42, buf)
+
+	// Simulate error completion
+	h.OnError(&api.WorkCompletion{WRID: 42}, nil)
+
+	if h.InFlight() != 0 {
+		t.Fatalf("expected 0 in-flight after error, got %d", h.InFlight())
+	}
+
+	pool.mu.Lock()
+	if len(pool.completed) != 1 {
+		t.Fatalf("expected 1 CompleteSend call on error, got %d", len(pool.completed))
+	}
+	pool.mu.Unlock()
+}
+
+func TestSendCompletionHandlerUnknownWRID(t *testing.T) {
+	pool := &mockSendPool{}
+	h := NewSendCompletionHandler(pool, nil)
+
+	// Completion for an untracked WRID — should not panic or call CompleteSend
+	h.OnCompletion(&api.WorkCompletion{WRID: 999, Status: api.WCSuccess})
+
+	pool.mu.Lock()
+	if len(pool.completed) != 0 {
+		t.Fatalf("expected 0 CompleteSend calls for unknown WRID, got %d", len(pool.completed))
+	}
+	pool.mu.Unlock()
+}
+
+func TestSendCompletionHandlerMultipleInFlight(t *testing.T) {
+	pool := &mockSendPool{}
+	callbackCount := atomic.Int32{}
+	h := NewSendCompletionHandler(pool, func() { callbackCount.Add(1) })
+
+	bufs := make([]*api.Buffer, 5)
+	for i := range bufs {
+		data := make([]byte, 64)
+		bufs[i] = &api.Buffer{Addr: unsafe.Pointer(&data[0]), Length: 64}
+		h.TrackSend(uint64(i+1), bufs[i])
+	}
+
+	if h.InFlight() != 5 {
+		t.Fatalf("expected 5 in-flight, got %d", h.InFlight())
+	}
+
+	// Complete out of order
+	h.OnCompletion(&api.WorkCompletion{WRID: 3, Status: api.WCSuccess})
+	h.OnCompletion(&api.WorkCompletion{WRID: 1, Status: api.WCSuccess})
+	h.OnCompletion(&api.WorkCompletion{WRID: 5, Status: api.WCSuccess})
+
+	if h.InFlight() != 2 {
+		t.Fatalf("expected 2 in-flight, got %d", h.InFlight())
+	}
+
+	pool.mu.Lock()
+	if len(pool.completed) != 3 {
+		t.Fatalf("expected 3 CompleteSend calls, got %d", len(pool.completed))
+	}
+	pool.mu.Unlock()
+
+	if callbackCount.Load() != 3 {
+		t.Fatalf("expected 3 callbacks, got %d", callbackCount.Load())
+	}
+}

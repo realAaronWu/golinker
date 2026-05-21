@@ -11,6 +11,8 @@ import (
 
 	"github.com/wua20/golinker/api"
 	"github.com/wua20/golinker/internal/rdma"
+	"github.com/wua20/golinker/pkg/cq"
+	"github.com/wua20/golinker/pkg/message"
 )
 
 // --- Mock SendBufferPool ---
@@ -63,8 +65,12 @@ func newMockRecvPool() *mockRecvPool {
 }
 
 func (p *mockRecvPool) Alloc(size int) (*api.Buffer, error) {
+	if size <= 0 {
+		size = 4096 // default buffer size for mock
+	}
+	data := make([]byte, size)
 	buf := &api.Buffer{
-		Addr:   unsafe.Pointer(&make([]byte, size)[0]),
+		Addr:   unsafe.Pointer(&data[0]),
 		Length: size,
 		LKey:   1,
 		RKey:   2,
@@ -613,5 +619,225 @@ func TestConnDoubleClose(t *testing.T) {
 	err = conn.Close()
 	if err != nil {
 		t.Fatalf("second Close failed: %v", err)
+	}
+}
+
+// --- FLOW-001: Send Path Tests ---
+
+func TestSendSignaledAndUniqueWRID(t *testing.T) {
+	mockVerbs := rdma.NewMockVerbs()
+	conn := newTestConn(mockVerbs)
+	conn.SetState(api.StateConnecting)
+	conn.SetState(api.StateConnected)
+
+	// Send two messages and verify unique WRIDs and SendSignaled flag
+	for i := 0; i < 2; i++ {
+		data := make([]byte, 64)
+		msg := &api.Message{
+			Buffer: &api.Buffer{
+				Addr:   unsafe.Pointer(&data[0]),
+				Length: 64,
+				LKey:   1,
+			},
+			Length: 64,
+		}
+		if err := conn.Send(msg); err != nil {
+			t.Fatalf("Send %d failed: %v", i, err)
+		}
+	}
+
+	log := mockVerbs.GetPostSendLog()
+	if len(log) != 2 {
+		t.Fatalf("expected 2 PostSend calls, got %d", len(log))
+	}
+
+	// WRIDs must be unique
+	if log[0].WRID == log[1].WRID {
+		t.Fatal("WRIDs must be unique across sends")
+	}
+
+	// SendSignaled must be set
+	for i, wr := range log {
+		if wr.SendFlags&api.SendSignaled == 0 {
+			t.Fatalf("send %d: expected SendSignaled flag, got flags=%d", i, wr.SendFlags)
+		}
+	}
+}
+
+func TestSendHandlerTracksAndReleasesBuffer(t *testing.T) {
+	mockVerbs := rdma.NewMockVerbs()
+	pool := newMockSendPool()
+	deps := ConnDeps{
+		Verbs:    mockVerbs,
+		QP:       &rdma.MockQP{},
+		SendPool: pool,
+		RecvPool: newMockRecvPool(),
+	}
+	conn := NewConn(1, "10.0.0.1:4791", deps)
+	conn.SetState(api.StateConnecting)
+	conn.SetState(api.StateConnected)
+
+	// Wire a real send completion handler
+	completedCount := 0
+	handler := cq.NewSendCompletionHandler(pool, func() { completedCount++ })
+	conn.SetSendHandler(handler)
+
+	data := make([]byte, 64)
+	buf := &api.Buffer{
+		Addr:   unsafe.Pointer(&data[0]),
+		Length: 64,
+		LKey:   1,
+	}
+	msg := &api.Message{Buffer: buf, Length: 64}
+
+	if err := conn.Send(msg); err != nil {
+		t.Fatalf("Send failed: %v", err)
+	}
+
+	if handler.InFlight() != 1 {
+		t.Fatalf("expected 1 in-flight, got %d", handler.InFlight())
+	}
+
+	// Simulate CQ completion
+	log := mockVerbs.GetPostSendLog()
+	handler.OnCompletion(&api.WorkCompletion{
+		WRID:   log[0].WRID,
+		Status: api.WCSuccess,
+	})
+
+	if handler.InFlight() != 0 {
+		t.Fatalf("expected 0 in-flight after completion, got %d", handler.InFlight())
+	}
+
+	if completedCount != 1 {
+		t.Fatalf("expected onComplete callback called once, got %d", completedCount)
+	}
+}
+
+// --- FLOW-002: Recv Path Tests ---
+
+func TestOnCompletionRecv(t *testing.T) {
+	mockVerbs := rdma.NewMockVerbs()
+	conn := newTestConn(mockVerbs)
+	conn.SetState(api.StateConnecting)
+	conn.SetState(api.StateConnected)
+
+	// Build a wire-format buffer: PostSend command header + one app message
+	payload := []byte("hello, RDMA!")
+	bufData := make([]byte, 4096)
+
+	// Pack using the wire format
+	n := message.PackSingle(bufData, payload)
+
+	// Register the buffer in the tracking map (simulating PostRecvBuffers)
+	wrid := uint64(42)
+	conn.TrackRecvBuffer(wrid, bufData)
+
+	// Simulate a recv completion
+	wc := &api.WorkCompletion{
+		WRID:    wrid,
+		Status:  api.WCSuccess,
+		Opcode:  api.WCRecv,
+		ByteLen: uint32(n),
+	}
+
+	conn.OnCompletion(wc)
+
+	// Should have delivered one message to recvCh
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	received, err := conn.Recv(ctx)
+	if err != nil {
+		t.Fatalf("Recv failed: %v", err)
+	}
+
+	// Verify the payload matches
+	recvData := unsafe.Slice((*byte)(received.Buffer.Addr), received.Length)
+	if string(recvData) != string(payload) {
+		t.Fatalf("expected payload %q, got %q", payload, recvData)
+	}
+}
+
+func TestOnCompletionIgnoresSendOpcode(t *testing.T) {
+	mockVerbs := rdma.NewMockVerbs()
+	conn := newTestConn(mockVerbs)
+	conn.SetState(api.StateConnecting)
+	conn.SetState(api.StateConnected)
+
+	// Send opcode should be ignored
+	wc := &api.WorkCompletion{
+		WRID:    1,
+		Status:  api.WCSuccess,
+		Opcode:  api.WCSend,
+		ByteLen: 100,
+	}
+
+	conn.OnCompletion(wc)
+
+	// recvCh should be empty
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := conn.Recv(ctx)
+	if err != context.DeadlineExceeded {
+		t.Fatalf("expected timeout (no message delivered), got %v", err)
+	}
+}
+
+func TestOnCompletionBatchedMessages(t *testing.T) {
+	mockVerbs := rdma.NewMockVerbs()
+	conn := newTestConn(mockVerbs)
+	conn.SetState(api.StateConnecting)
+	conn.SetState(api.StateConnected)
+
+	// Pack multiple messages into one buffer
+	msgs := [][]byte{[]byte("msg1"), []byte("msg2"), []byte("msg3")}
+	bufData := make([]byte, 4096)
+	n := message.PackBatch(bufData, msgs)
+
+	// Register the buffer in the tracking map
+	wrid := uint64(100)
+	conn.TrackRecvBuffer(wrid, bufData)
+
+	wc := &api.WorkCompletion{
+		WRID:    wrid,
+		Status:  api.WCSuccess,
+		Opcode:  api.WCRecv,
+		ByteLen: uint32(n),
+	}
+
+	conn.OnCompletion(wc)
+
+	// Should deliver 3 messages
+	for i, expected := range msgs {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		received, err := conn.Recv(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("Recv %d failed: %v", i, err)
+		}
+		recvData := unsafe.Slice((*byte)(received.Buffer.Addr), received.Length)
+		if string(recvData) != string(expected) {
+			t.Fatalf("message %d: expected %q, got %q", i, expected, recvData)
+		}
+	}
+}
+
+// --- Manager wiring tests ---
+
+func TestManagerConnectWiresSendHandler(t *testing.T) {
+	mgr, _, _ := newTestManager()
+	defer mgr.Close()
+
+	conn, err := mgr.Connect(context.Background(), "10.0.0.1:4791")
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+
+	// The concrete Conn should have a sendHandler set
+	c := conn.(*Conn)
+	if c.sendHandler == nil {
+		t.Fatal("expected sendHandler to be wired after Connect")
 	}
 }

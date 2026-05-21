@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/wua20/golinker/api"
+	"github.com/wua20/golinker/pkg/cq"
 )
 
 // Errors for manager operations.
@@ -32,6 +33,9 @@ type ManagerConfig struct {
 	QPConfig   api.QueuePairConfig
 	CMAcceptor api.CMAcceptor
 	CMDialer   api.CMDialer
+
+	// OnSendComplete is called after each send completion (e.g. Aggregator.OnSendComplete).
+	OnSendComplete func()
 }
 
 // Manager implements api.ConnectionManager.
@@ -110,6 +114,15 @@ func (m *Manager) Connect(ctx context.Context, addr string) (api.Connection, err
 		deps.Dialer = m.cfg.CMDialer
 
 		conn := NewConn(id, addr, deps)
+
+		// Wire send completion handler
+		m.wireSendHandler(conn)
+
+		// Wire recv CQ handler and pre-post recv buffers before StateConnected
+		if err := m.wireRecvPath(conn, qp); err != nil {
+			return nil, err
+		}
+
 		conn.SetState(api.StateConnected) // CM dial blocks until ESTABLISHED
 		m.connections.Store(id, conn)
 		m.cmIDConns.Store(cmID, conn)
@@ -118,10 +131,48 @@ func (m *Manager) Connect(ctx context.Context, addr string) (api.Connection, err
 
 	// Fall back to mock behavior (no real CM)
 	conn := NewConn(id, addr, deps)
+
+	// Wire send completion handler
+	m.wireSendHandler(conn)
+
 	conn.SetState(api.StateConnecting)
 	conn.SetState(api.StateConnected)
 	m.connections.Store(id, conn)
 	return conn, nil
+}
+
+// wireSendHandler creates a SendCompletionHandler for the connection and
+// registers it with the CQPoller on the SendCQ.
+func (m *Manager) wireSendHandler(conn *Conn) {
+	if m.cfg.SendPool == nil {
+		return
+	}
+	h := cq.NewSendCompletionHandler(m.cfg.SendPool, m.cfg.OnSendComplete)
+	conn.SetSendHandler(h)
+
+	if m.cfg.CQPoller != nil && m.cfg.SendCQ != nil {
+		// Best-effort registration — if the CQ is already registered
+		// (shared across connections), AddCQ returns an error we can ignore.
+		_ = m.cfg.CQPoller.AddCQ(m.cfg.SendCQ, h)
+	}
+}
+
+// wireRecvPath registers the connection as recv CompletionHandler on the RecvCQ
+// and pre-posts receive buffers so the QP is ready before StateConnected.
+func (m *Manager) wireRecvPath(conn *Conn, _ api.QueuePair) error {
+	if m.cfg.CQPoller != nil && m.cfg.RecvCQ != nil {
+		// Best-effort registration for recv CQ
+		_ = m.cfg.CQPoller.AddCQ(m.cfg.RecvCQ, conn)
+	}
+
+	depth := m.cfg.QueueDepth
+	if depth <= 0 {
+		depth = 64
+	}
+	if err := conn.PostRecvBuffers(depth); err != nil {
+		return fmt.Errorf("failed to post recv buffers: %w", err)
+	}
+	return nil
 }
 
 // GetConnection retrieves a connection by ID.

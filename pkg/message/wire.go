@@ -3,19 +3,23 @@ package message
 import (
 	"encoding/binary"
 	"errors"
+	"time"
 )
 
-// Wire format header (per message within a batch):
-// [4 bytes: message length (uint32 little-endian)] [N bytes: payload]
-//
-// An aggregated buffer looks like:
-// [batch header: 4 bytes count] [msg1_len][msg1_data][msg2_len][msg2_data]...
-
+// Command header constants
 const (
-	// BatchHeaderSize is the size of the batch header (uint32 message count).
-	BatchHeaderSize = 4
-	// MsgHeaderSize is the per-message length prefix size (uint32).
-	MsgHeaderSize = 4
+	CmdHeaderSize = 12 // 4B type + 8B reserved
+	AppHeaderSize = 12 // 8B timestamp + 4B size
+)
+
+// Command types per design.md §11
+const (
+	CmdPostSend       uint32 = 230
+	CmdReadInvitation uint32 = 231
+	CmdReadComplete   uint32 = 232
+	CmdWriteRequest   uint32 = 233
+	CmdWriteApprove   uint32 = 234
+	CmdHeartbeat      uint32 = 235
 )
 
 var (
@@ -23,21 +27,58 @@ var (
 	ErrBufferTooSmall = errors.New("message: buffer too small")
 	// ErrInvalidBatch indicates a malformed batch buffer.
 	ErrInvalidBatch = errors.New("message: invalid batch format")
+	// ErrUnknownCommand indicates an unrecognized command type.
+	ErrUnknownCommand = errors.New("message: unknown command type")
 )
 
-// PackBatch writes batch header + length-prefixed messages into buf.
+// EncodeCmdHeader writes a 12-byte command header at buf[0:12].
+func EncodeCmdHeader(buf []byte, cmdType uint32) {
+	binary.BigEndian.PutUint32(buf[0:4], cmdType)
+	// reserved 8 bytes: zero them
+	binary.BigEndian.PutUint32(buf[4:8], 0)
+	binary.BigEndian.PutUint32(buf[8:12], 0)
+}
+
+// DecodeCmdHeader reads the command type from a 12-byte header.
+func DecodeCmdHeader(buf []byte) (uint32, error) {
+	if len(buf) < CmdHeaderSize {
+		return 0, ErrInvalidBatch
+	}
+	return binary.BigEndian.Uint32(buf[0:4]), nil
+}
+
+// EncodeAppHeader writes a 12-byte app message header.
+func EncodeAppHeader(buf []byte, timestamp uint64, size uint32) {
+	binary.BigEndian.PutUint64(buf[0:8], timestamp)
+	binary.BigEndian.PutUint32(buf[8:12], size)
+}
+
+// DecodeAppHeader reads timestamp and message size from a 12-byte app header.
+func DecodeAppHeader(buf []byte) (timestamp uint64, size uint32, err error) {
+	if len(buf) < AppHeaderSize {
+		return 0, 0, ErrInvalidBatch
+	}
+	timestamp = binary.BigEndian.Uint64(buf[0:8])
+	size = binary.BigEndian.Uint32(buf[8:12])
+	return timestamp, size, nil
+}
+
+// PackBatch writes a PostSend command header followed by N app messages into buf.
+// Each message gets a 12-byte app header (timestamp + size) followed by its payload.
 // Returns total bytes written.
 func PackBatch(buf []byte, messages [][]byte) int {
 	offset := 0
 
-	// Write batch header: message count
-	binary.LittleEndian.PutUint32(buf[offset:], uint32(len(messages)))
-	offset += BatchHeaderSize
+	// Write command header (type = PostSend)
+	EncodeCmdHeader(buf[offset:], CmdPostSend)
+	offset += CmdHeaderSize
 
-	// Write each message with length prefix
+	now := uint64(time.Now().UnixNano())
+
+	// Write each message with app header
 	for _, msg := range messages {
-		binary.LittleEndian.PutUint32(buf[offset:], uint32(len(msg)))
-		offset += MsgHeaderSize
+		EncodeAppHeader(buf[offset:], now, uint32(len(msg)))
+		offset += AppHeaderSize
 		copy(buf[offset:], msg)
 		offset += len(msg)
 	}
@@ -45,46 +86,58 @@ func PackBatch(buf []byte, messages [][]byte) int {
 	return offset
 }
 
-// UnpackBatch parses a batch buffer into individual messages.
+// UnpackBatch parses a buffer containing a command header + N app messages.
+// Returns the individual message payloads (without headers).
 // length is the total number of valid bytes in data.
 func UnpackBatch(data []byte, length int) ([][]byte, error) {
-	if length < BatchHeaderSize {
+	if length < CmdHeaderSize {
 		return nil, ErrInvalidBatch
 	}
 
-	count := binary.LittleEndian.Uint32(data[0:BatchHeaderSize])
-	offset := BatchHeaderSize
+	cmdType, err := DecodeCmdHeader(data)
+	if err != nil {
+		return nil, err
+	}
+	if cmdType != CmdPostSend {
+		return nil, ErrUnknownCommand
+	}
 
-	messages := make([][]byte, 0, count)
-	for i := uint32(0); i < count; i++ {
-		if offset+MsgHeaderSize > length {
+	offset := CmdHeaderSize
+	var messages [][]byte
+
+	for offset < length {
+		if offset+AppHeaderSize > length {
 			return nil, ErrInvalidBatch
 		}
-		msgLen := int(binary.LittleEndian.Uint32(data[offset : offset+MsgHeaderSize]))
-		offset += MsgHeaderSize
+		_, msgSize, err := DecodeAppHeader(data[offset:])
+		if err != nil {
+			return nil, err
+		}
+		offset += AppHeaderSize
 
-		if offset+msgLen > length {
+		if offset+int(msgSize) > length {
 			return nil, ErrInvalidBatch
 		}
-		msg := make([]byte, msgLen)
-		copy(msg, data[offset:offset+msgLen])
+		msg := make([]byte, msgSize)
+		copy(msg, data[offset:offset+int(msgSize)])
 		messages = append(messages, msg)
-		offset += msgLen
+		offset += int(msgSize)
 	}
 
 	return messages, nil
 }
 
-// PackSingle writes a single message as a count=1 batch. Returns bytes written.
+// PackSingle writes a single message as a PostSend with one app message.
+// Returns total bytes written.
 func PackSingle(buf []byte, msg []byte) int {
 	return PackBatch(buf, [][]byte{msg})
 }
 
 // BatchSize calculates the total buffer space needed for a batch of messages.
 func BatchSize(messages [][]byte) int {
-	size := BatchHeaderSize
+	size := CmdHeaderSize
 	for _, msg := range messages {
-		size += MsgHeaderSize + len(msg)
+		size += AppHeaderSize + len(msg)
 	}
 	return size
 }

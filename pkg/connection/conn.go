@@ -8,6 +8,8 @@ import (
 	"unsafe"
 
 	"github.com/wua20/golinker/api"
+	"github.com/wua20/golinker/pkg/cq"
+	"github.com/wua20/golinker/pkg/message"
 )
 
 // Errors for connection operations.
@@ -27,7 +29,7 @@ type ConnDeps struct {
 	Dialer   api.CMDialer   // for disconnect on close (may be nil)
 }
 
-// Conn implements api.Connection for a single RDMA connection.
+// Conn implements api.Connection and api.CompletionHandler for a single RDMA connection.
 type Conn struct {
 	id         uint64
 	remoteAddr string
@@ -40,6 +42,14 @@ type Conn struct {
 
 	recvCh chan *api.Message
 	done   chan struct{}
+
+	// Send path: tracks in-flight send buffers via WRID
+	sendHandler *cq.SendCompletionHandler
+	nextWRID    atomic.Uint64
+
+	// Recv path: tracks posted recv buffers (WRID → backing slice)
+	recvBufsMu sync.Mutex
+	recvBufs   map[uint64][]byte
 }
 
 // NewConn creates a new connection in StateInit.
@@ -50,6 +60,7 @@ func NewConn(id uint64, remoteAddr string, deps ConnDeps) *Conn {
 		deps:       deps,
 		recvCh:     make(chan *api.Message, 128),
 		done:       make(chan struct{}),
+		recvBufs:   make(map[uint64][]byte),
 	}
 	c.state.Store(int32(api.StateInit))
 	return c
@@ -70,15 +81,48 @@ func (c *Conn) State() api.ConnectionState {
 	return api.ConnectionState(c.state.Load())
 }
 
+// SetSendHandler registers the send completion handler for buffer tracking.
+func (c *Conn) SetSendHandler(h *cq.SendCompletionHandler) {
+	c.sendHandler = h
+}
+
+// GetSendHandler returns the send completion handler (for testing/integration).
+func (c *Conn) GetSendHandler() api.CompletionHandler {
+	if c.sendHandler == nil {
+		return nil
+	}
+	return c.sendHandler
+}
+
+// TrackRecvBuffer manually registers a recv buffer for WRID-based lookup.
+// Used by tests and by PostRecvBuffers.
+func (c *Conn) TrackRecvBuffer(wrid uint64, data []byte) {
+	c.recvBufsMu.Lock()
+	c.recvBufs[wrid] = data
+	c.recvBufsMu.Unlock()
+}
+
 // Send posts a send work request. Only valid in StateConnected.
+// The caller must have already packed the wire format into msg.Buffer.
+// Send assigns a unique WRID, sets IBV_SEND_SIGNALED, and tracks the buffer
+// for release when the CQ completion arrives.
 func (c *Conn) Send(msg *api.Message) error {
 	if c.State() != api.StateConnected {
 		return ErrNotConnected
 	}
 
+	wrid := c.nextWRID.Add(1)
+
+	// Track the buffer for completion-driven release
+	if c.sendHandler != nil && msg.Buffer != nil {
+		c.sendHandler.TrackSend(wrid, msg.Buffer)
+	}
+
 	wr := &api.SendWR{
-		WRID:   c.id,
-		Opcode: 0, // IBV_WR_SEND
+		WRID:      wrid,
+		Opcode:    0, // IBV_WR_SEND
+		SendFlags: api.SendSignaled,
+		ImmData:   msg.ImmData,
 	}
 
 	if msg.Buffer != nil {
@@ -91,9 +135,14 @@ func (c *Conn) Send(msg *api.Message) error {
 		}
 	}
 
-	wr.ImmData = msg.ImmData
-
-	return c.deps.Verbs.PostSend(c.deps.QP, wr)
+	if err := c.deps.Verbs.PostSend(c.deps.QP, wr); err != nil {
+		// Untrack on failure so the buffer isn't leaked in the handler
+		if c.sendHandler != nil && msg.Buffer != nil {
+			c.sendHandler.OnError(&api.WorkCompletion{WRID: wrid}, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // Recv blocks until a message is received or the context is cancelled.
@@ -178,5 +227,106 @@ func (c *Conn) DeliverRecv(msg *api.Message) {
 	}
 }
 
-// Ensure Conn implements api.Connection.
+// PostRecvBuffers allocates recv buffers, tracks their WRID→data mapping,
+// and posts them to the QP. Must be called before the connection is advertised
+// as usable (design rule: recv WRs posted before StateConnected).
+func (c *Conn) PostRecvBuffers(count int) error {
+	if c.deps.RecvPool == nil || c.deps.QP == nil {
+		return nil
+	}
+	for i := 0; i < count; i++ {
+		buf, err := c.deps.RecvPool.Alloc(0)
+		if err != nil {
+			return err
+		}
+
+		data := unsafe.Slice((*byte)(buf.Addr), buf.Length)
+		wrid := uint64(uintptr(buf.Addr))
+
+		c.recvBufsMu.Lock()
+		c.recvBufs[wrid] = data
+		c.recvBufsMu.Unlock()
+
+		wr := &api.RecvWR{
+			WRID: wrid,
+			SGList: []api.SGE{{
+				Addr:   uint64(uintptr(buf.Addr)),
+				Length: uint32(buf.Length),
+				LKey:   buf.LKey,
+			}},
+		}
+		if err := c.deps.Verbs.PostRecv(c.deps.QP, wr); err != nil {
+			c.recvBufsMu.Lock()
+			delete(c.recvBufs, wrid)
+			c.recvBufsMu.Unlock()
+			c.deps.RecvPool.Free(buf)
+			return err
+		}
+	}
+	return nil
+}
+
+// OnCompletion handles a work completion from the CQ poller.
+// For recv completions: looks up the tracked buffer, unpacks wire format,
+// delivers messages, and re-posts one buffer.
+func (c *Conn) OnCompletion(wc *api.WorkCompletion) {
+	if wc.Opcode != api.WCRecv && wc.Opcode != api.WCRecvRdmaWithImm {
+		return // send completions handled by SendCompletionHandler
+	}
+
+	if wc.ByteLen == 0 {
+		c.replenishRecv()
+		return
+	}
+
+	// Look up the recv buffer by WRID
+	c.recvBufsMu.Lock()
+	data, ok := c.recvBufs[wc.WRID]
+	delete(c.recvBufs, wc.WRID)
+	c.recvBufsMu.Unlock()
+
+	if !ok {
+		c.OnError(wc, errors.New("connection: recv completion for unknown WRID"))
+		c.replenishRecv()
+		return
+	}
+
+	messages, err := message.UnpackBatch(data[:wc.ByteLen], int(wc.ByteLen))
+	if err != nil {
+		c.OnError(wc, err)
+		c.replenishRecv()
+		return
+	}
+
+	for _, payload := range messages {
+		msgBuf := make([]byte, len(payload))
+		copy(msgBuf, payload)
+		msg := &api.Message{
+			Buffer: &api.Buffer{
+				Addr:   unsafe.Pointer(&msgBuf[0]),
+				Length: len(msgBuf),
+			},
+			Length: len(msgBuf),
+		}
+		if wc.HasIMM {
+			msg.ImmData = wc.IMM
+		}
+		c.DeliverRecv(msg)
+	}
+
+	c.replenishRecv()
+}
+
+// OnError handles a work completion error (required by api.CompletionHandler).
+func (c *Conn) OnError(_ *api.WorkCompletion, _ error) {
+	// TODO: log error, potentially transition to error state
+}
+
+// replenishRecv re-posts one recv buffer to keep the receive pipeline full.
+func (c *Conn) replenishRecv() {
+	_ = c.PostRecvBuffers(1)
+}
+
+// Ensure Conn implements api.Connection and api.CompletionHandler.
 var _ api.Connection = (*Conn)(nil)
+var _ api.CompletionHandler = (*Conn)(nil)

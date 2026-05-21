@@ -1,6 +1,7 @@
 package cq
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/wua20/golinker/api"
@@ -63,3 +64,75 @@ func (h *ChannelHandler) OnError(wc *api.WorkCompletion, err error) {
 
 // Compile-time interface check.
 var _ api.CompletionHandler = (*ChannelHandler)(nil)
+
+// SendCompletionHandler routes send completions back to the SendPool and
+// an optional callback (typically Aggregator.OnSendComplete). It maintains
+// a WRID → Buffer mapping so the correct buffer is released on completion.
+type SendCompletionHandler struct {
+	sendPool   api.SendBufferPool
+	onComplete func() // called after each send completion (e.g. Aggregator.OnSendComplete)
+
+	mu      sync.Mutex
+	wridMap map[uint64]*api.Buffer
+}
+
+// NewSendCompletionHandler creates a handler that bridges CQ completions to SendPool.
+func NewSendCompletionHandler(sendPool api.SendBufferPool, onComplete func()) *SendCompletionHandler {
+	return &SendCompletionHandler{
+		sendPool:   sendPool,
+		onComplete: onComplete,
+		wridMap:    make(map[uint64]*api.Buffer),
+	}
+}
+
+// TrackSend records a buffer associated with a WRID for later release.
+func (h *SendCompletionHandler) TrackSend(wrid uint64, buf *api.Buffer) {
+	h.mu.Lock()
+	h.wridMap[wrid] = buf
+	h.mu.Unlock()
+}
+
+// OnCompletion handles a successful send completion by releasing the buffer
+// back to the pool and calling the onComplete callback.
+func (h *SendCompletionHandler) OnCompletion(wc *api.WorkCompletion) {
+	h.mu.Lock()
+	buf, ok := h.wridMap[wc.WRID]
+	if ok {
+		delete(h.wridMap, wc.WRID)
+	}
+	h.mu.Unlock()
+
+	if ok && buf != nil {
+		h.sendPool.CompleteSend(buf)
+		if h.onComplete != nil {
+			h.onComplete()
+		}
+	}
+}
+
+// OnError handles a send completion error by releasing the buffer.
+func (h *SendCompletionHandler) OnError(wc *api.WorkCompletion, err error) {
+	if wc == nil {
+		return
+	}
+	h.mu.Lock()
+	buf, ok := h.wridMap[wc.WRID]
+	if ok {
+		delete(h.wridMap, wc.WRID)
+	}
+	h.mu.Unlock()
+
+	if ok && buf != nil {
+		h.sendPool.CompleteSend(buf)
+	}
+}
+
+// InFlight returns the number of tracked in-flight sends.
+func (h *SendCompletionHandler) InFlight() int {
+	h.mu.Lock()
+	n := len(h.wridMap)
+	h.mu.Unlock()
+	return n
+}
+
+var _ api.CompletionHandler = (*SendCompletionHandler)(nil)

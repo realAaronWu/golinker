@@ -180,15 +180,15 @@ func TestFlushOnThreshold(t *testing.T) {
 	agg.ongoingSends.Store(1)
 
 	// Send enough data to exceed threshold
-	// BatchHeaderSize(4) + MsgHeaderSize(4) + 50 = 58 per message
-	// 2 messages = 4 + (4+50)*2 = 112 > 100 threshold
+	// CmdHeaderSize(12) + AppHeaderSize(12) + 50 = 74 per single message batch
+	// 2 messages = 12 + (12+50)*2 = 136 > 100 threshold
 	data := bytes.Repeat([]byte("x"), 50)
 
 	err := agg.Send(data)
 	if err != nil {
 		t.Fatalf("Send 1 failed: %v", err)
 	}
-	// First message: BatchHeaderSize + (MsgHeaderSize+50) = 4+54 = 58, below threshold
+	// First message: CmdHeaderSize + (AppHeaderSize+50) = 12+62 = 74, below threshold
 	log := conn.getSendLog()
 	if len(log) != 0 {
 		t.Fatalf("expected 0 sends after first msg, got %d", len(log))
@@ -198,7 +198,7 @@ func TestFlushOnThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Send 2 failed: %v", err)
 	}
-	// Second message: BatchHeaderSize + 2*(MsgHeaderSize+50) = 4+108 = 112 > 100
+	// Second message: CmdHeaderSize + 2*(AppHeaderSize+50) = 12+124 = 136 > 100
 	log = conn.getSendLog()
 	if len(log) != 1 {
 		t.Fatalf("expected 1 flush (threshold), got %d", len(log))
@@ -222,14 +222,14 @@ func TestFlushOnOverflow(t *testing.T) {
 	// Simulate ongoing send to prevent idle flush
 	agg.ongoingSends.Store(1)
 
-	// Fill most of the buffer: BatchHeaderSize(4) + MsgHeaderSize(4) + 100 = 108
+	// Fill most of the buffer: CmdHeaderSize(12) + AppHeaderSize(12) + 100 = 124
 	data1 := bytes.Repeat([]byte("a"), 100)
 	err := agg.Send(data1)
 	if err != nil {
 		t.Fatalf("Send 1 failed: %v", err)
 	}
 
-	// This should trigger overflow: 108 + (4 + 50) = 162 > 128
+	// This should trigger overflow: 124 + (12 + 50) = 186 > 128
 	data2 := bytes.Repeat([]byte("b"), 50)
 	err = agg.Send(data2)
 	if err != nil {
@@ -463,7 +463,7 @@ func TestStats(t *testing.T) {
 	agg.sendThreshold = 50
 	agg.mu.Unlock()
 
-	// Send message that exceeds threshold: BatchHeaderSize(4) + MsgHeaderSize(4) + 50 = 58 > 50
+	// Send message that exceeds threshold: CmdHeaderSize(12) + AppHeaderSize(12) + 50 = 74 > 50
 	err := agg.Send(bytes.Repeat([]byte("x"), 50))
 	if err != nil {
 		t.Fatalf("aggregate Send failed: %v", err)

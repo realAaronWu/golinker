@@ -88,6 +88,13 @@ const (
 	AccessRemoteAtomic
 )
 
+// Send flag constants (matching ibv_send_flags).
+const (
+	SendSignaled  = 1 << 0 // IBV_SEND_SIGNALED
+	SendSolicited = 1 << 1 // IBV_SEND_SOLICITED
+	SendInline    = 1 << 2 // IBV_SEND_INLINE
+)
+
 // SendWR represents a send work request.
 type SendWR struct {
 	WRID      uint64

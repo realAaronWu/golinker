@@ -189,6 +189,47 @@ func TestSendPoolInFlight(t *testing.T) {
 	}
 }
 
+func TestSendPoolIsBusy(t *testing.T) {
+	pool, _ := setupTestPool(t, 4) // threshold = 4/2 = 2
+	sp := NewSendPool(pool)
+	defer sp.Close()
+
+	// Initially not busy (0 in-flight).
+	if sp.IsBusy() {
+		t.Fatal("Expected IsBusy()=false with 0 in-flight buffers")
+	}
+
+	// Acquire first buffer → 1 in-flight, still not busy (1 < 2).
+	buf1, err := sp.AcquireForSend()
+	if err != nil {
+		t.Fatalf("AcquireForSend failed: %v", err)
+	}
+	if sp.IsBusy() {
+		t.Fatal("Expected IsBusy()=false with 1 in-flight buffer")
+	}
+
+	// Acquire second buffer → 2 in-flight, now busy (2 >= 2).
+	buf2, err := sp.AcquireForSend()
+	if err != nil {
+		t.Fatalf("AcquireForSend failed: %v", err)
+	}
+	if !sp.IsBusy() {
+		t.Fatal("Expected IsBusy()=true with 2 in-flight buffers")
+	}
+
+	// Complete one send → 1 in-flight, not busy (1 < 2).
+	sp.CompleteSend(buf2)
+	if sp.IsBusy() {
+		t.Fatal("Expected IsBusy()=false with 1 in-flight buffer after CompleteSend")
+	}
+
+	// Complete last send → 0 in-flight, not busy.
+	sp.CompleteSend(buf1)
+	if sp.IsBusy() {
+		t.Fatal("Expected IsBusy()=false with 0 in-flight buffers after all completed")
+	}
+}
+
 func TestRecvPoolPostAndReplenish(t *testing.T) {
 	verbs := rdma.NewMockVerbs()
 	pd := &rdma.MockPD{}
