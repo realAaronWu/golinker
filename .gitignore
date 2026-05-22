@@ -22,3 +22,4 @@ railyard/
 # OS
 .DS_Store
 Thumbs.db
+docs/RDMA_diag.md
