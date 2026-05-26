@@ -6,6 +6,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -23,6 +24,9 @@ type mockCQ struct {
 
 func (m *mockCQ) Handle() unsafe.Pointer { return unsafe.Pointer(m) }
 func (m *mockCQ) Size() int              { return m.size }
+func (m *mockCQ) CompChannelFD() int     { return -1 }
+func (m *mockCQ) ReqNotify() error       { return nil }
+func (m *mockCQ) AckEvents(nevents uint) {}
 
 type mockHandler struct {
 	mu          sync.Mutex
@@ -77,6 +81,9 @@ func (m *mockVerbs) CreateQP(pd api.ProtectionDomain, sendCQ, recvCQ api.Complet
 }
 func (m *mockVerbs) RegMR(pd api.ProtectionDomain, addr unsafe.Pointer, length int, access api.AccessFlags) (api.MemoryRegion, error) {
 	return nil, nil
+}
+func (m *mockVerbs) CreateCQWithChannel(size int) (api.CompletionQueue, error) {
+	return m.CreateCQ(size)
 }
 func (m *mockVerbs) DeregMR(mr api.MemoryRegion) error                { return nil }
 func (m *mockVerbs) PostSend(qp api.QueuePair, wr *api.SendWR) error  { return nil }
@@ -554,6 +561,182 @@ func TestPollerClose(t *testing.T) {
 		t.Error("expected error for double start")
 	}
 	_ = poller2.Close()
+}
+
+// --- Event-Driven Mode Tests ---
+
+// eventMockCQ implements api.CompletionQueue with a pipe-based comp channel.
+type eventMockCQ struct {
+	id            int
+	size          int
+	compChannelFD int
+}
+
+func (m *eventMockCQ) Handle() unsafe.Pointer { return unsafe.Pointer(m) }
+func (m *eventMockCQ) Size() int              { return m.size }
+func (m *eventMockCQ) CompChannelFD() int     { return m.compChannelFD }
+func (m *eventMockCQ) ReqNotify() error       { return nil }
+func (m *eventMockCQ) AckEvents(nevents uint) {}
+
+func TestPollerEventModeWithCompChannel(t *testing.T) {
+	// Create a pipe to simulate a completion channel FD.
+	var fds [2]int
+	if err := syscall.Pipe(fds[:]); err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	readFD, writeFD := fds[0], fds[1]
+	defer syscall.Close(writeFD)
+
+	// Track completions injected after wake-up.
+	var wakeCount atomic.Int64
+	pollFn := func(cq api.CompletionQueue, maxWCs int) ([]api.WorkCompletion, error) {
+		n := wakeCount.Add(1)
+		if n <= 3 {
+			return []api.WorkCompletion{
+				{WRID: uint64(n), Status: api.WCSuccess, Opcode: api.WCRecv, ByteLen: 64},
+			}, nil
+		}
+		return nil, nil
+	}
+
+	cfg := PollerConfig{
+		PollMode:     config.PollModeEvent,
+		MaxBatchSize: 32,
+		SpinCount:    1024,
+		PollFunc:     pollFn,
+	}
+
+	poller := NewPoller(cfg)
+	handler := &mockHandler{}
+	cq := &eventMockCQ{id: 1, size: 128, compChannelFD: readFD}
+
+	if err := poller.AddCQ(cq, handler); err != nil {
+		t.Fatalf("AddCQ failed: %v", err)
+	}
+
+	if err := poller.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Give the event waiter time to arm and drain initial completions.
+	time.Sleep(50 * time.Millisecond)
+
+	// Record poll count before wake.
+	countBefore := wakeCount.Load()
+
+	// Wait a bit — the poller should be parked (no new polls).
+	time.Sleep(50 * time.Millisecond)
+	countAfterWait := wakeCount.Load()
+	if countAfterWait-countBefore > 2 {
+		t.Errorf("poller should be parked but poll count increased: before=%d after=%d", countBefore, countAfterWait)
+	}
+
+	// Write to the pipe to simulate a CQ event — wake the poller.
+	buf := []byte{0, 0, 0, 0, 0, 0, 0, 1}
+	if _, err := syscall.Write(writeFD, buf); err != nil {
+		t.Fatalf("write to pipe: %v", err)
+	}
+
+	// Wait for the poller to wake and poll.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for poller to wake after pipe write")
+		default:
+		}
+		if wakeCount.Load() > countAfterWait {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	if err := poller.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+}
+
+func TestPollerSmartModeWithCompChannel(t *testing.T) {
+	// Create a pipe to simulate a completion channel FD.
+	var fds [2]int
+	if err := syscall.Pipe(fds[:]); err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	readFD, writeFD := fds[0], fds[1]
+	defer syscall.Close(writeFD)
+
+	// Phase tracking: completions during the first few polls, then empty.
+	var pollCount atomic.Int64
+	injectedCount := int64(5) // Return completions for the first 5 polls
+
+	pollFn := func(cq api.CompletionQueue, maxWCs int) ([]api.WorkCompletion, error) {
+		n := pollCount.Add(1)
+		if n <= injectedCount {
+			return []api.WorkCompletion{
+				{WRID: uint64(n), Status: api.WCSuccess, Opcode: api.WCRecv, ByteLen: 32},
+			}, nil
+		}
+		return nil, nil
+	}
+
+	cfg := PollerConfig{
+		PollMode:     config.PollModeSmart,
+		MaxBatchSize: 32,
+		SpinCount:    50, // Low spin count for faster test
+		PollFunc:     pollFn,
+	}
+
+	poller := NewPoller(cfg)
+	handler := &mockHandler{}
+	cq := &eventMockCQ{id: 1, size: 128, compChannelFD: readFD}
+
+	if err := poller.AddCQ(cq, handler); err != nil {
+		t.Fatalf("AddCQ failed: %v", err)
+	}
+	if err := poller.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Wait for the smart loop to exhaust injected completions and spin down.
+	// After injectedCount + SpinCount empty polls, it should park.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for smart mode to spin down")
+		default:
+		}
+		if pollCount.Load() >= injectedCount+int64(cfg.SpinCount)+1 {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	// Now the poller should be parked. Record count and wait.
+	countBeforePark := pollCount.Load()
+	time.Sleep(50 * time.Millisecond)
+	countAfterPark := pollCount.Load()
+	delta := countAfterPark - countBeforePark
+	if delta > 3 {
+		t.Errorf("smart mode should be parked: delta=%d", delta)
+	}
+
+	// Wake by writing to the pipe.
+	buf := []byte{0, 0, 0, 0, 0, 0, 0, 1}
+	if _, err := syscall.Write(writeFD, buf); err != nil {
+		t.Fatalf("write to pipe: %v", err)
+	}
+
+	// Verify it wakes and resumes busy-poll.
+	time.Sleep(50 * time.Millisecond)
+	countAfterWake := pollCount.Load()
+	if countAfterWake <= countAfterPark {
+		t.Error("smart mode should have resumed after wake")
+	}
+
+	if err := poller.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
 }
 
 // --- SendCompletionHandler Tests ---

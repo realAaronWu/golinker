@@ -237,6 +237,13 @@ func PollCQ(cq *C.struct_ibv_cq, maxWCs int, reposts []RepostItem) ([]WorkComple
 	return completions, nil
 }
 
+// PollCQByHandle polls the CQ using an unsafe.Pointer handle (for use by pkg/cq).
+// It wraps PollCQ without reposts. Returns nil slice on empty poll.
+func PollCQByHandle(cqHandle unsafe.Pointer, maxWCs int) ([]WorkCompletion, error) {
+	cq := (*C.struct_ibv_cq)(cqHandle)
+	return PollCQ(cq, maxWCs, nil)
+}
+
 // BatchPostSend posts multiple send work requests in a single ibv_post_send call
 // using the hotpath C function.
 func BatchPostSend(items []SendItem) error {

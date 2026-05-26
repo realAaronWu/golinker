@@ -22,6 +22,17 @@ type MemoryRegion interface {
 type CompletionQueue interface {
 	Handle() unsafe.Pointer
 	Size() int
+	// CompChannelFD returns the file descriptor of the CQ's completion channel,
+	// or -1 if the CQ was created without a completion channel.
+	CompChannelFD() int
+	// ReqNotify arms the CQ to generate a completion event on the next work
+	// completion. Must be called before parking on the comp channel FD.
+	// Returns nil on CQs without a completion channel (no-op).
+	ReqNotify() error
+	// AckEvents acknowledges nevents completion events previously received
+	// from the completion channel. Must be called before destroying the CQ.
+	// No-op on CQs without a completion channel.
+	AckEvents(nevents uint)
 }
 
 // QueuePair wraps ibv_qp.
@@ -39,6 +50,10 @@ type Verbs interface {
 	OpenDevice(devName string) error
 	AllocPD() (ProtectionDomain, error)
 	CreateCQ(size int) (CompletionQueue, error)
+	// CreateCQWithChannel creates a CQ with an associated completion channel.
+	// The returned CQ's CompChannelFD() will return a valid FD (>= 0) for use
+	// with event-driven or smart polling modes.
+	CreateCQWithChannel(size int) (CompletionQueue, error)
 	CreateQP(pd ProtectionDomain, sendCQ, recvCQ CompletionQueue, cfg QueuePairConfig) (QueuePair, error)
 	RegMR(pd ProtectionDomain, addr unsafe.Pointer, length int, access AccessFlags) (MemoryRegion, error)
 	DeregMR(mr MemoryRegion) error

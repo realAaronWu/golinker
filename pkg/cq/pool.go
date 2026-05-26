@@ -7,14 +7,16 @@ import (
 	"sync"
 
 	"github.com/wua20/golinker/api"
+	"github.com/wua20/golinker/pkg/config"
 )
 
 // Pool implements api.CQPool, managing a pool of CQ pollers for load distribution.
 type Pool struct {
-	mu      sync.Mutex
-	verbs   api.Verbs
-	pollers []*Poller
-	cqSize  int
+	mu       sync.Mutex
+	verbs    api.Verbs
+	pollers  []*Poller
+	cqSize   int
+	pollMode config.PollMode
 
 	// cqMap tracks which poller each CQ is registered with
 	cqMap map[api.CompletionQueue]*Poller
@@ -33,10 +35,11 @@ func NewPool(verbs api.Verbs, numPollers int, cfg PollerConfig) (*Pool, error) {
 	}
 
 	pool := &Pool{
-		verbs:   verbs,
-		pollers: make([]*Poller, numPollers),
-		cqSize:  4096, // default CQ size
-		cqMap:   make(map[api.CompletionQueue]*Poller),
+		verbs:    verbs,
+		pollers:  make([]*Poller, numPollers),
+		cqSize:   4096, // default CQ size
+		pollMode: cfg.PollMode,
+		cqMap:    make(map[api.CompletionQueue]*Poller),
 	}
 
 	for i := 0; i < numPollers; i++ {
@@ -74,8 +77,14 @@ func (p *Pool) Assign() (api.CQPoller, api.CompletionQueue, error) {
 		}
 	}
 
-	// Create a new CQ via verbs
-	cq, err := p.verbs.CreateCQ(p.cqSize)
+	// Create a new CQ via verbs — use completion channel for event/smart modes
+	var cq api.CompletionQueue
+	var err error
+	if p.pollMode == config.PollModeEvent || p.pollMode == config.PollModeSmart {
+		cq, err = p.verbs.CreateCQWithChannel(p.cqSize)
+	} else {
+		cq, err = p.verbs.CreateCQ(p.cqSize)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("cq: failed to create CQ: %w", err)
 	}
