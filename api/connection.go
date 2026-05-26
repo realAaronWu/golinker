@@ -32,7 +32,13 @@ type Connection interface {
 	State() ConnectionState
 
 	// Send posts a send WR. Non-blocking; completion via CompletionHandler.
+	// This is the low-level path; prefer SendPayload for application use.
 	Send(msg *Message) error
+
+	// SendPayload sends application data through the aggregation layer.
+	// When the pool is not busy, sends immediately (lowest latency).
+	// When the pool is busy, batches messages and flushes on threshold/overflow/idle.
+	SendPayload(data []byte) error
 
 	// Recv returns the next received message (blocks).
 	Recv(ctx context.Context) (*Message, error)

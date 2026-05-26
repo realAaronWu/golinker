@@ -5,6 +5,7 @@ package connection
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -52,6 +53,8 @@ func (p *mockSendPool) AcquireForSend() (*api.Buffer, error) {
 }
 
 func (p *mockSendPool) CompleteSend(buf *api.Buffer) {}
+
+func (p *mockSendPool) BusyFlag() *atomic.Bool { return &atomic.Bool{} }
 
 // --- Mock RecvBufferPool ---
 

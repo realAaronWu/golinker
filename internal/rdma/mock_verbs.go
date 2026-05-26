@@ -4,6 +4,7 @@ package rdma
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -98,6 +99,7 @@ func (m *MockQP) ModifyToRTS() error {
 
 // MockVerbs implements api.Verbs with in-memory fakes.
 type MockVerbs struct {
+	mu           sync.Mutex
 	deviceName   string
 	postSendLog  []api.SendWR
 	postRecvLog  []api.RecvWR
@@ -153,12 +155,16 @@ func (m *MockVerbs) DeregMR(mr api.MemoryRegion) error {
 }
 
 func (m *MockVerbs) PostSend(qp api.QueuePair, wr *api.SendWR) error {
+	m.mu.Lock()
 	m.postSendLog = append(m.postSendLog, *wr)
+	m.mu.Unlock()
 	return nil
 }
 
 func (m *MockVerbs) PostRecv(qp api.QueuePair, wr *api.RecvWR) error {
+	m.mu.Lock()
 	m.postRecvLog = append(m.postRecvLog, *wr)
+	m.mu.Unlock()
 	return nil
 }
 
@@ -179,12 +185,20 @@ func (m *MockVerbs) GetPipeWriteFDs() []int {
 
 // GetPostSendLog returns the recorded send work requests.
 func (m *MockVerbs) GetPostSendLog() []api.SendWR {
-	return m.postSendLog
+	m.mu.Lock()
+	log := make([]api.SendWR, len(m.postSendLog))
+	copy(log, m.postSendLog)
+	m.mu.Unlock()
+	return log
 }
 
 // GetPostRecvLog returns the recorded receive work requests.
 func (m *MockVerbs) GetPostRecvLog() []api.RecvWR {
-	return m.postRecvLog
+	m.mu.Lock()
+	log := make([]api.RecvWR, len(m.postRecvLog))
+	copy(log, m.postRecvLog)
+	m.mu.Unlock()
+	return log
 }
 
 // --- MockCMEventChannel ---

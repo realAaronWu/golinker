@@ -127,6 +127,14 @@ func (h *SendCompletionHandler) OnError(wc *api.WorkCompletion, err error) {
 	}
 }
 
+// SetOnComplete replaces the onComplete callback. Used to wire aggregator
+// after initial handler creation.
+func (h *SendCompletionHandler) SetOnComplete(fn func()) {
+	h.mu.Lock()
+	h.onComplete = fn
+	h.mu.Unlock()
+}
+
 // InFlight returns the number of tracked in-flight sends.
 func (h *SendCompletionHandler) InFlight() int {
 	h.mu.Lock()

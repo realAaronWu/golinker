@@ -1,6 +1,9 @@
 package api
 
-import "unsafe"
+import (
+	"sync/atomic"
+	"unsafe"
+)
 
 // Buffer represents a registered RDMA buffer.
 type Buffer struct {
@@ -35,6 +38,10 @@ type SendBufferPool interface {
 	AcquireForSend() (*Buffer, error)
 	// CompleteSend marks a send buffer as reclaimable.
 	CompleteSend(buf *Buffer)
+	// BusyFlag returns a shared atomic flag that is set when the pool is under
+	// pressure (>= 50% buffers in-flight) and cleared when all are returned.
+	// The aggregation engine reads this to decide between immediate and batched sends.
+	BusyFlag() *atomic.Bool
 }
 
 // RecvBufferPool extends BufferPool with receive-specific semantics.

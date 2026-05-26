@@ -37,6 +37,7 @@ func (p *mockPool) Stats() api.BufferPoolStats                   { return api.Bu
 func (p *mockPool) Close() error                                 { return nil }
 func (p *mockPool) AcquireForSend() (*api.Buffer, error)         { return p.Alloc(0) }
 func (p *mockPool) CompleteSend(_ *api.Buffer)                   {}
+func (p *mockPool) BusyFlag() *atomic.Bool                       { return &atomic.Bool{} }
 func (p *mockPool) PostRecvBuffers(_ api.QueuePair, _ int) error { return nil }
 func (p *mockPool) Replenish(_ api.QueuePair, _ int) error       { return nil }
 

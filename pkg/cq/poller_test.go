@@ -759,6 +759,7 @@ func (p *mockSendPool) CompleteSend(buf *api.Buffer) {
 	p.completed = append(p.completed, buf)
 	p.mu.Unlock()
 }
+func (p *mockSendPool) BusyFlag() *atomic.Bool { return &atomic.Bool{} }
 
 func TestSendCompletionHandlerBasic(t *testing.T) {
 	pool := &mockSendPool{}

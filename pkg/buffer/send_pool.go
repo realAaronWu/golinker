@@ -12,6 +12,7 @@ type SendPool struct {
 	pool      *Pool
 	inFlight  sync.Map    // maps uintptr(buffer addr) → struct{}
 	inFlightN int64       // atomic counter for in-flight buffers
+	busy      atomic.Bool // shared with aggregation engine; set at 50%, clear at 0%
 }
 
 // NewSendPool creates a new send buffer pool wrapping the given pool.
@@ -44,23 +45,35 @@ func (sp *SendPool) Close() error {
 }
 
 // AcquireForSend gets a buffer and marks it as in-flight.
+// Updates the busy flag when >= 50% of buffers are in-flight.
 func (sp *SendPool) AcquireForSend() (*api.Buffer, error) {
 	buf, err := sp.pool.Alloc(0)
 	if err != nil {
 		return nil, err
 	}
 	sp.inFlight.Store(unsafeAddr(buf.Addr), struct{}{})
-	atomic.AddInt64(&sp.inFlightN, 1)
+	n := atomic.AddInt64(&sp.inFlightN, 1)
+	threshold := int64(sp.pool.cfg.BufferCount / 2)
+	if threshold < 1 {
+		threshold = 1
+	}
+	if n >= threshold {
+		sp.busy.Store(true)
+	}
 	return buf, nil
 }
 
 // CompleteSend marks a send buffer as reclaimable and returns it to the pool.
+// Clears the busy flag when all buffers are returned (hysteresis: set at 50%, clear at 0%).
 func (sp *SendPool) CompleteSend(buf *api.Buffer) {
 	if buf == nil {
 		return
 	}
 	if _, loaded := sp.inFlight.LoadAndDelete(unsafeAddr(buf.Addr)); loaded {
-		atomic.AddInt64(&sp.inFlightN, -1)
+		n := atomic.AddInt64(&sp.inFlightN, -1)
+		if n == 0 {
+			sp.busy.Store(false)
+		}
 	}
 	sp.pool.Free(buf)
 }
@@ -74,6 +87,12 @@ func (sp *SendPool) IsBusy() bool {
 		threshold = 1
 	}
 	return inFlight >= threshold
+}
+
+// BusyFlag returns the shared atomic busy flag for use by the aggregation engine.
+// The flag is set when >= 50% of buffers are in-flight and cleared when all are returned.
+func (sp *SendPool) BusyFlag() *atomic.Bool {
+	return &sp.busy
 }
 
 // IsInFlight checks if a buffer is currently in-flight (for testing).

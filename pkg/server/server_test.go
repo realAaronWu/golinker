@@ -34,9 +34,10 @@ func newMockConn(id uint64) *mockConnection {
 	}
 }
 
-func (m *mockConnection) ID() uint64                                        { return m.id }
-func (m *mockConnection) RemoteAddr() string                                { return m.addr }
-func (m *mockConnection) State() api.ConnectionState                        { return m.state }
+func (m *mockConnection) ID() uint64                                         { return m.id }
+func (m *mockConnection) RemoteAddr() string                                 { return m.addr }
+func (m *mockConnection) State() api.ConnectionState                         { return m.state }
+func (m *mockConnection) SendPayload(_ []byte) error                         { return nil }
 func (m *mockConnection) OnStateChange(fn func(old, new api.ConnectionState)) {}
 
 func (m *mockConnection) Send(msg *api.Message) error {

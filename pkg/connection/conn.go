@@ -47,6 +47,9 @@ type Conn struct {
 	sendHandler *cq.SendCompletionHandler
 	nextWRID    atomic.Uint64
 
+	// Aggregation: batches messages under load, immediate when idle
+	aggregator *message.Aggregator
+
 	// Recv path: tracks posted recv buffers (WRID → backing slice)
 	recvBufsMu sync.Mutex
 	recvBufs   map[uint64][]byte
@@ -143,6 +146,40 @@ func (c *Conn) Send(msg *api.Message) error {
 		return err
 	}
 	return nil
+}
+
+// SetAggregator configures the aggregation engine for this connection.
+// Must be called before the connection enters StateConnected.
+func (c *Conn) SetAggregator(agg *message.Aggregator) {
+	c.aggregator = agg
+}
+
+// SendPayload sends application data through the aggregation layer.
+// Routes through the aggregator if configured; otherwise falls back to
+// an immediate send using the send buffer pool.
+func (c *Conn) SendPayload(data []byte) error {
+	if c.State() != api.StateConnected {
+		return ErrNotConnected
+	}
+	if c.aggregator != nil {
+		return c.aggregator.Send(data)
+	}
+	// Fallback: immediate send without aggregator
+	if c.deps.SendPool == nil {
+		return errors.New("connection: no send pool configured")
+	}
+	buf, err := c.deps.SendPool.AcquireForSend()
+	if err != nil {
+		return err
+	}
+	totalNeeded := message.CmdHeaderSize + message.AppHeaderSize + len(data)
+	if totalNeeded > buf.Length {
+		c.deps.SendPool.CompleteSend(buf)
+		return message.ErrBufferTooSmall
+	}
+	dest := unsafe.Slice((*byte)(buf.Addr), buf.Length)
+	n := message.PackSingle(dest, data)
+	return c.Send(&api.Message{Buffer: buf, Length: n})
 }
 
 // Recv blocks until a message is received or the context is cancelled.

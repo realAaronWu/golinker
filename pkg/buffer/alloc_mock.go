@@ -8,6 +8,9 @@ import "unsafe"
 // This is necessary because we return unsafe.Pointer to the data.
 var mockAllocations = make(map[unsafe.Pointer][]byte)
 
+// SetNUMANode is a no-op in mock mode.
+func SetNUMANode(_ int) {}
+
 // allocBuffer allocates a buffer from the Go heap (mock mode).
 func allocBuffer(size int) unsafe.Pointer {
 	buf := make([]byte, size)

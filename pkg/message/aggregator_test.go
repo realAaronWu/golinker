@@ -28,6 +28,7 @@ func (m *mockConn) Send(msg *api.Message) error {
 func (m *mockConn) ID() uint64                                         { return 1 }
 func (m *mockConn) RemoteAddr() string                                 { return "mock://remote" }
 func (m *mockConn) State() api.ConnectionState                         { return api.StateConnected }
+func (m *mockConn) SendPayload(_ []byte) error                         { return nil }
 func (m *mockConn) Recv(_ context.Context) (*api.Message, error)       { return nil, nil }
 func (m *mockConn) Close() error                                       { return nil }
 func (m *mockConn) OnStateChange(_ func(old, new api.ConnectionState)) {}
@@ -83,6 +84,10 @@ func (p *mockSendPool) Stats() api.BufferPoolStats {
 
 func (p *mockSendPool) Close() error {
 	return nil
+}
+
+func (p *mockSendPool) BusyFlag() *atomic.Bool {
+	return &atomic.Bool{}
 }
 
 // --- Tests ---

@@ -11,6 +11,7 @@ import (
 
 	"github.com/wua20/golinker/api"
 	"github.com/wua20/golinker/pkg/cq"
+	"github.com/wua20/golinker/pkg/message"
 )
 
 // Errors for manager operations.
@@ -34,7 +35,13 @@ type ManagerConfig struct {
 	CMAcceptor api.CMAcceptor
 	CMDialer   api.CMDialer
 
+	// Aggregation configuration
+	EnableAggregate bool // if true, create aggregator per connection
+	BufferSize      int  // max send buffer capacity (default 12288)
+	SendThreshold   int  // flush threshold (default 9216)
+
 	// OnSendComplete is called after each send completion (e.g. Aggregator.OnSendComplete).
+	// When EnableAggregate is true, this is wired automatically.
 	OnSendComplete func()
 }
 
@@ -118,6 +125,9 @@ func (m *Manager) Connect(ctx context.Context, addr string) (api.Connection, err
 		// Wire send completion handler
 		m.wireSendHandler(conn)
 
+		// Wire aggregator (must be after wireSendHandler)
+		m.wireAggregator(conn)
+
 		// Wire recv CQ handler and pre-post recv buffers before StateConnected
 		if err := m.wireRecvPath(conn, qp); err != nil {
 			return nil, err
@@ -135,6 +145,9 @@ func (m *Manager) Connect(ctx context.Context, addr string) (api.Connection, err
 	// Wire send completion handler
 	m.wireSendHandler(conn)
 
+	// Wire aggregator (must be after wireSendHandler)
+	m.wireAggregator(conn)
+
 	conn.SetState(api.StateConnecting)
 	conn.SetState(api.StateConnected)
 	m.connections.Store(id, conn)
@@ -147,13 +160,56 @@ func (m *Manager) wireSendHandler(conn *Conn) {
 	if m.cfg.SendPool == nil {
 		return
 	}
-	h := cq.NewSendCompletionHandler(m.cfg.SendPool, m.cfg.OnSendComplete)
+
+	// Determine send-complete callback: aggregator's OnSendComplete (if enabled)
+	// chains with user-provided callback.
+	onComplete := m.cfg.OnSendComplete
+
+	h := cq.NewSendCompletionHandler(m.cfg.SendPool, onComplete)
 	conn.SetSendHandler(h)
 
 	if m.cfg.CQPoller != nil && m.cfg.SendCQ != nil {
 		// Best-effort registration — if the CQ is already registered
 		// (shared across connections), AddCQ returns an error we can ignore.
 		_ = m.cfg.CQPoller.AddCQ(m.cfg.SendCQ, h)
+	}
+}
+
+// wireAggregator creates and configures an Aggregator for the connection.
+// Wires the SendPool busy flag and OnSendComplete callback.
+func (m *Manager) wireAggregator(conn *Conn) {
+	if !m.cfg.EnableAggregate || m.cfg.SendPool == nil {
+		return
+	}
+
+	bufSize := m.cfg.BufferSize
+	if bufSize <= 0 {
+		bufSize = message.DefaultBufferSize
+	}
+	threshold := m.cfg.SendThreshold
+	if threshold <= 0 {
+		threshold = message.DefaultSendThreshold
+	}
+
+	agg := message.NewAggregator(conn, m.cfg.SendPool, message.AggregatorConfig{
+		BufferSize:      bufSize,
+		SendThreshold:   threshold,
+		EnableAggregate: true,
+	})
+
+	// Wire the pool's busy flag to the aggregator
+	agg.SetBusy(m.cfg.SendPool.BusyFlag())
+
+	conn.SetAggregator(agg)
+
+	// Re-wire the send handler's onComplete to also call aggregator.OnSendComplete
+	if conn.sendHandler != nil {
+		conn.sendHandler.SetOnComplete(func() {
+			agg.OnSendComplete()
+			if m.cfg.OnSendComplete != nil {
+				m.cfg.OnSendComplete()
+			}
+		})
 	}
 }
 

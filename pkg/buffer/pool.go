@@ -55,6 +55,9 @@ func NewPool(verbs api.Verbs, pd api.ProtectionDomain, cfg PoolConfig) (*Pool, e
 
 	id := int(atomic.AddInt64(&poolIDCounter, 1))
 
+	// Configure NUMA node for allocation (no-op if !numa build tag).
+	SetNUMANode(cfg.NUMANode)
+
 	p := &Pool{
 		verbs:      verbs,
 		pd:         pd,
