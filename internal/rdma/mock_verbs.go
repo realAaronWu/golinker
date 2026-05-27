@@ -5,10 +5,20 @@ package rdma
 import (
 	"context"
 	"sync/atomic"
+	"syscall"
 	"unsafe"
 
 	"github.com/wua20/golinker/api"
 )
+
+// mockPipe creates a pipe and returns (readFD, writeFD, error).
+func mockPipe() (int, int, error) {
+	var fds [2]int
+	if err := syscall.Pipe(fds[:]); err != nil {
+		return -1, -1, err
+	}
+	return fds[0], fds[1], nil
+}
 
 // qpCounter is a package-level counter for QP number assignment.
 var qpCounter uint32
@@ -47,11 +57,15 @@ func (m *MockMR) RKey() uint32          { return m.rkey }
 
 // MockCQ implements api.CompletionQueue.
 type MockCQ struct {
-	size int
+	size          int
+	compChannelFD int // -1 when no channel; set to pipe read FD for event testing
 }
 
 func (m *MockCQ) Handle() unsafe.Pointer { return nil }
 func (m *MockCQ) Size() int              { return m.size }
+func (m *MockCQ) CompChannelFD() int     { return m.compChannelFD }
+func (m *MockCQ) ReqNotify() error       { return nil }
+func (m *MockCQ) AckEvents(nevents uint) {}
 
 // --- MockQP ---
 
@@ -84,10 +98,11 @@ func (m *MockQP) ModifyToRTS() error {
 
 // MockVerbs implements api.Verbs with in-memory fakes.
 type MockVerbs struct {
-	deviceName  string
-	postSendLog []api.SendWR
-	postRecvLog []api.RecvWR
-	closed      bool
+	deviceName   string
+	postSendLog  []api.SendWR
+	postRecvLog  []api.RecvWR
+	pipeWriteFDs []int // write ends of pipes for mock comp channels
+	closed       bool
 }
 
 // NewMockVerbs creates a new MockVerbs instance.
@@ -105,7 +120,18 @@ func (m *MockVerbs) AllocPD() (api.ProtectionDomain, error) {
 }
 
 func (m *MockVerbs) CreateCQ(size int) (api.CompletionQueue, error) {
-	return &MockCQ{size: size}, nil
+	return &MockCQ{size: size, compChannelFD: -1}, nil
+}
+
+func (m *MockVerbs) CreateCQWithChannel(size int) (api.CompletionQueue, error) {
+	// In mock builds, create a pipe so tests can signal the "completion channel".
+	r, w, err := mockPipe()
+	if err != nil {
+		return nil, err
+	}
+	// Store the write end so tests can trigger wake-ups.
+	m.pipeWriteFDs = append(m.pipeWriteFDs, w)
+	return &MockCQ{size: size, compChannelFD: r}, nil
 }
 
 func (m *MockVerbs) CreateQP(pd api.ProtectionDomain, sendCQ, recvCQ api.CompletionQueue, cfg api.QueuePairConfig) (api.QueuePair, error) {
@@ -138,7 +164,17 @@ func (m *MockVerbs) PostRecv(qp api.QueuePair, wr *api.RecvWR) error {
 
 func (m *MockVerbs) Close() error {
 	m.closed = true
+	for _, fd := range m.pipeWriteFDs {
+		syscall.Close(fd)
+	}
+	m.pipeWriteFDs = nil
 	return nil
+}
+
+// GetPipeWriteFDs returns the write ends of mock completion channel pipes.
+// Tests can write to these FDs to simulate CQ event wake-ups.
+func (m *MockVerbs) GetPipeWriteFDs() []int {
+	return m.pipeWriteFDs
 }
 
 // GetPostSendLog returns the recorded send work requests.

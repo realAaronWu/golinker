@@ -41,12 +41,33 @@ func (m *RealMR) RKey() uint32          { return uint32(m.mr.rkey) }
 
 // RealCQ wraps *C.struct_ibv_cq as api.CompletionQueue.
 type RealCQ struct {
-	cq   *C.struct_ibv_cq
-	size int
+	cq            *C.struct_ibv_cq
+	size          int
+	compChannelFD int // -1 when no channel
+	compChannel   *C.struct_ibv_comp_channel
 }
 
 func (c *RealCQ) Handle() unsafe.Pointer { return unsafe.Pointer(c.cq) }
 func (c *RealCQ) Size() int              { return c.size }
+func (c *RealCQ) CompChannelFD() int     { return c.compChannelFD }
+
+func (c *RealCQ) ReqNotify() error {
+	if c.compChannel == nil {
+		return nil
+	}
+	ret := C.ibv_req_notify_cq(c.cq, 0)
+	if ret != 0 {
+		return fmt.Errorf("ibv_req_notify_cq failed: %d", ret)
+	}
+	return nil
+}
+
+func (c *RealCQ) AckEvents(nevents uint) {
+	if c.compChannel == nil {
+		return
+	}
+	C.ibv_ack_cq_events(c.cq, C.uint(nevents))
+}
 
 // RealQP wraps *C.struct_ibv_qp as api.QueuePair.
 type RealQP struct {
@@ -174,7 +195,25 @@ func (v *RealVerbs) CreateCQ(size int) (api.CompletionQueue, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &RealCQ{cq: cq, size: size}, nil
+	return &RealCQ{cq: cq, size: size, compChannelFD: -1}, nil
+}
+
+func (v *RealVerbs) CreateCQWithChannel(size int) (api.CompletionQueue, error) {
+	// Create completion channel
+	channel := C.ibv_create_comp_channel(v.ctx)
+	if channel == nil {
+		return nil, errors.New("ibv_create_comp_channel failed")
+	}
+
+	// Create CQ bound to the completion channel
+	cq := C.ibv_create_cq(v.ctx, C.int(size), nil, channel, 0)
+	if cq == nil {
+		C.ibv_destroy_comp_channel(channel)
+		return nil, errors.New("ibv_create_cq with comp_channel failed")
+	}
+
+	fd := int(channel.fd)
+	return &RealCQ{cq: cq, size: size, compChannelFD: fd, compChannel: channel}, nil
 }
 
 func (v *RealVerbs) CreateQP(pd api.ProtectionDomain, sendCQ, recvCQ api.CompletionQueue, cfg api.QueuePairConfig) (api.QueuePair, error) {

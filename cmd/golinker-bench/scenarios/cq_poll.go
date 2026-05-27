@@ -127,3 +127,6 @@ type benchCQ struct {
 
 func (m *benchCQ) Handle() unsafe.Pointer { return nil }
 func (m *benchCQ) Size() int              { return m.size }
+func (m *benchCQ) CompChannelFD() int     { return -1 }
+func (m *benchCQ) ReqNotify() error       { return nil }
+func (m *benchCQ) AckEvents(nevents uint) {}
