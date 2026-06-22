@@ -446,6 +446,53 @@ CQ Poll → conn.OnCompletion(wc)
 
 ---
 
+## Phase 6: Aggregation + CQ Modes + NUMA
+
+**Commits**: `0404b2e` (event/smart CQ polling) + `5202f48` (aggregation wiring + NUMA)
+**Strategy**: Sequential execution; CQ-mode work captured via the OpenSpec change
+`event-smart-cq-polling`, then aggregation/NUMA wiring on the `feature-new-CQ-mode`
+branch.
+
+### Overview
+
+Phase 6 implemented the three adaptive performance mechanisms from `design.md`:
+real event-driven and smart CQ polling (replacing the placeholder event channel with
+real completion-channel FDs parked via Go's netpoller), NUMA-aware buffer allocation,
+and wiring of the aggregation engine into the connection send path.
+
+### Tickets
+
+| Ticket | Scope | Key Changes | design.md § |
+|--------|-------|-------------|-------------|
+| DOMAIN-103 | Event + smart CQ polling | `pkg/cq/poller.go` (`eventWaiterLoop`, `smartWaiterLoop`, arm-then-poll), `pollfunc_real.go`/`pollfunc_mock.go` (`DefaultPollFunc`), `pool.go` (`CreateCQWithChannel` for event/smart modes); `api.CompletionQueue` gains `CompChannelFD()`/`ReqNotify()`/`AckEvents()`; real + mock verbs implement comp channel (pipe-based in mock) | §6.2, §6.3, §6.4 |
+| DOMAIN-104 | NUMA-aware allocation | `pkg/buffer/alloc_numa_cgo.go` (`numa_alloc_onnode`/`numa_free`), `pkg/util/util.go` (`DetectNUMANode` via sysfs), `alloc_cgo.go` wiring | §8.2 |
+| DOMAIN-102 / FLOW-003 | Aggregation engine + send-path wiring | `pkg/connection/conn.go`, `manager.go` route `Send()` through aggregator/immediate driven by `SendPool.IsBusy()`; busy flag in `send_pool.go`; integration coverage in `test/integration/aggregation_test.go` | §5 |
+
+### CQ Mode Implementation Notes (DOMAIN-103)
+
+- Event mode: per-CQ goroutine wraps the comp channel FD with `os.NewFile`, arms via
+  `ReqNotify`, drains during the arm window (arm-then-poll), then parks on `f.Read()`.
+  On wake: `AckEvents(1)` → drain → re-arm. CQs without a comp channel fall back to
+  busy-poll.
+- Smart mode: busy-polls for `SpinCount` empty rounds, then arms + parks; any
+  completion during the arm window returns it to busy-poll without parking.
+- Mock builds use a `pipe(2)` pair as the comp channel so tests trigger wake-ups by
+  writing to the pipe write end (`GetPipeWriteFDs`).
+- **Bookkeeping deviation**: CGo comp-channel bindings were implemented as methods on
+  `RealCQ`/`RealVerbs` in `real_verbs.go` (not as standalone functions in `verbs.go`),
+  and named `ReqNotify`/`AckEvents` (not `ReqNotifyCQ`/`AckCQEvents`). See the
+  reconciliation note in `openspec/changes/event-smart-cq-polling/tasks.md`.
+
+### Conformance / Validation Status
+
+- `go build -tags mock ./...` — clean.
+- `go test -tags mock -race ./...` — all packages pass (7 test packages green).
+- **Not yet validated on real verbs / SoftRoCE.** Task 7.3 of the OpenSpec change and
+  §14.5 Rule 5 in the traceability matrix remain outstanding. CONFORM-002 (Phase 6
+  design audit) and VERIFY-002 (aggregation + CQ-mode benchmark) have not been run.
+
+---
+
 ## Cumulative Statistics
 
 | Phase | Agents | Parallel | Total Files | Total LOC | Tests Added |
@@ -456,16 +503,27 @@ CQ Poll → conn.OnCompletion(wc)
 | Phase 3 | 3 agents | Yes | 11 | ~1,692 | 18 |
 | Benchmark | 3 agents | Yes | 14 | ~1,773 | 0 |
 | Phase 5 | 1 (Architect) | No | 12 | ~794 | 23 |
-| **Total** | **18 dispatches** | | **77 files** | **~8,892** | **75 tests** |
+| Phase 6 | sequential | No | ~28 (2 commits) | ~1,800 | ~20 (cq + integration) |
+| **Total** | | | **~90 files** | **~10,700** | **~95 tests** |
 
 ---
 
-## Next Steps (Phase 6)
+## Next Steps (Phase 7 onward)
 
-Remaining work:
-- `pkg/health/` — Heartbeat monitor (CmdHeartbeat 235), buffer monitor, liveness probes
-- `pkg/metrics/` — Prometheus integration, latency histograms, throughput counters
-- Large message protocol — RDMA READ (CmdReadInvitation 231, CmdReadComplete 232)
-- End-to-end scenarios (require real RDMA transport / SoftRoCE)
-- Controller mode (multi-node orchestration)
-- CI integration (regression detection with `golinker-bench report --compare`)
+**Highest priority — validation gap (blocks confidence in Phases 5-6):**
+- Stand up SoftRoCE (rxe) and run the real-verbs data-path tests (VERIFY-001/002,
+  OpenSpec task 7.3, §14.5 Rule 5). Everything is mock-validated only today.
+- Run CONFORM-002 (Phase 6 design conformance audit).
+
+**Phase 7 — Large message protocol (`design.md` §7.2-7.4):**
+- `pkg/buffer/` large buffer allocator with global cap (DOMAIN-105)
+- RDMA READ protocol — `ibv_post_read`, ReadInvitation(231)/ReadComplete(232) (DOMAIN-106, FLOW-004)
+
+**Phase 8 — Self-healing (`design.md` §10):**
+- `pkg/health/` (currently a stub): heartbeat monitor (CmdHeartbeat 235),
+  buffer monitor (4 sweep actions), dynamic CQ resize (DOMAIN-107/108/109)
+
+**Phase 9 — Composition + observability + perf validation:**
+- `pkg/metrics/` (currently a stub): Prometheus integration
+- FLOW-005 full system composition, VERIFY-005 hardware performance targets,
+  CONFORM-005 final audit

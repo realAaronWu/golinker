@@ -1093,25 +1093,25 @@ its implementation, and tracks completion status.
 | §4.1 | CGo Hot-Path: poll_and_repost | SYSTEM-003 | 1 | **Done** (hotpath.c) |
 | §4.2 | CGo Hot-Path: batch_post_send | SYSTEM-003 | 1 | **Done** (hotpath.c) |
 | §4.3 | CGo Hot-Path: post_send | SYSTEM-003 | 1 | **Done** (hotpath.c) |
-| §5.1 | Aggregation: busy flag | DOMAIN-102 | 6 | Pending |
-| §5.2 | Aggregation: threshold trigger | DOMAIN-102 | 6 | Pending |
-| §5.3 | Aggregation: overflow trigger | DOMAIN-102 | 6 | Pending |
-| §5.4 | Aggregation: idle trigger | DOMAIN-102 | 6 | Pending |
-| §5.5 | Aggregation: no timer | DOMAIN-102, CONFORM-002 | 6 | Pending |
+| §5.1 | Aggregation: busy flag | DOMAIN-102 | 6 | **Done** (send_pool.go, aggregator.go) |
+| §5.2 | Aggregation: threshold trigger | DOMAIN-102 | 6 | **Done** (aggregator.go) |
+| §5.3 | Aggregation: overflow trigger | DOMAIN-102 | 6 | **Done** (aggregator.go) |
+| §5.4 | Aggregation: idle trigger | DOMAIN-102 | 6 | **Done** (aggregator.go) |
+| §5.5 | Aggregation: no timer | DOMAIN-102, CONFORM-002 | 6 | **Done** (no time.After in flush path) |
 | §6.1 | CQ Polling: busy mode | DOMAIN-006 | 2 | **Done** (poller.go) |
-| §6.2 | CQ Polling: event mode | DOMAIN-103 | 6 | Pending |
-| §6.3 | CQ Polling: smart mode | DOMAIN-103 | 6 | Pending |
-| §6.4 | CQ Polling: user mode | DOMAIN-103 | 6 | Pending |
+| §6.2 | CQ Polling: event mode | DOMAIN-103 | 6 | **Done** (poller.go eventWaiterLoop) |
+| §6.3 | CQ Polling: smart mode | DOMAIN-103 | 6 | **Done** (poller.go smartWaiterLoop) |
+| §6.4 | CQ Polling: user mode | DOMAIN-103 | 6 | **Done** (poller.go PollModeUser) |
 | §6.5 | CQ Pool: round-robin | DOMAIN-006 | 2 | **Done** (pool.go) |
-| §7.1 | Small msg: send path | FLOW-001 | 5 | Pending |
-| §7.1 | Small msg: recv path | FLOW-002 | 5 | Pending |
-| §7.1 | Small msg: buffer pools | DOMAIN-101 | 5 | Pending |
+| §7.1 | Small msg: send path | FLOW-001 | 5 | **Done** (mock-validated; not yet on real verbs) |
+| §7.1 | Small msg: recv path | FLOW-002 | 5 | **Done** (mock-validated; not yet on real verbs) |
+| §7.1 | Small msg: buffer pools | DOMAIN-101 | 5 | **Done** (send_pool.go, recv_pool.go) |
 | §7.2 | Large msg: RDMA READ protocol | DOMAIN-106 | 7 | Pending |
 | §7.3 | Large msg: HOL blocking prevention | DOMAIN-106, VERIFY-003 | 7 | Pending |
 | §7.4 | Large msg: buffer lifecycle | DOMAIN-105 | 7 | Pending |
 | §8.1 | Memory: off-heap allocation | DOMAIN-005 | 2 | **Done** (alloc_cgo.go) |
-| §8.2 | Memory: NUMA-aware placement | DOMAIN-104 | 6 | Pending |
-| §8.3 | Memory: single-MR-per-pool | DOMAIN-101 | 5 | Pending |
+| §8.2 | Memory: NUMA-aware placement | DOMAIN-104 | 6 | **Done** (alloc_numa_cgo.go, util.go) |
+| §8.3 | Memory: single-MR-per-pool | DOMAIN-101 | 5 | **Done** (pool.go) |
 | §9.1 | Connection: goroutine-per-connection | DOMAIN-007 | 2 | **Done** (conn.go) |
 | §9.2 | Connection: 8-phase handshake | Manual fix | Post-4 | **Done** (real_cm.go) |
 | §9.3 | Connection: server accept | Manual fix | Post-4 | **Done** (listener.go) |
@@ -1119,39 +1119,48 @@ its implementation, and tracks completion status.
 | §10.1 | Health: heartbeat | DOMAIN-108 | 8 | Pending |
 | §10.2 | Health: buffer monitor | DOMAIN-107 | 8 | Pending |
 | §10.3 | Health: dynamic CQ resize | DOMAIN-109 | 8 | Pending |
-| §11.1 | Wire: command header (12B) | DOMAIN-100 | 5 | Pending |
-| §11.2 | Wire: app message header (12B BE) | DOMAIN-100 | 5 | Pending |
-| §11.3 | Wire: aggregated layout | DOMAIN-100 | 5 | Pending |
+| §11.1 | Wire: command header (12B) | DOMAIN-100 | 5 | **Done** (wire.go) |
+| §11.2 | Wire: app message header (12B BE) | DOMAIN-100 | 5 | **Done** (wire.go) |
+| §11.3 | Wire: aggregated layout | DOMAIN-100 | 5 | **Done** (wire.go) |
 | §12 | Tradeoff Analysis | — | — | N/A (analysis) |
 | §13 | Performance Targets | VERIFY-005 | 9 | Pending |
-| §14.1 | Data path: cross-cutting flow | FLOW-001, FLOW-002 | 5 | Pending |
-| §14.2 | Data path: 5 required operations | VERIFY-001 | 5 | Pending |
-| §14.5 | Data path: Rule 1 (recv before usable) | FLOW-002 | 5 | Pending |
-| §14.5 | Data path: Rule 2 (send signaling) | FLOW-001 | 5 | Pending |
-| §14.5 | Data path: Rule 3 (CQ before verbs) | FLOW-001, FLOW-002 | 5 | Pending |
-| §14.5 | Data path: Rule 4 (closed-loop buffers) | FLOW-001, FLOW-002 | 5 | Pending |
-| §14.5 | Data path: Rule 5 (test with real verbs) | VERIFY-001 | 5 | Pending |
+| §14.1 | Data path: cross-cutting flow | FLOW-001, FLOW-002 | 5 | **Done** (mock-validated) |
+| §14.2 | Data path: 5 required operations | VERIFY-001 | 5 | **Done** (mock-validated) |
+| §14.5 | Data path: Rule 1 (recv before usable) | FLOW-002 | 5 | **Done** (mock-validated) |
+| §14.5 | Data path: Rule 2 (send signaling) | FLOW-001 | 5 | **Done** (mock-validated) |
+| §14.5 | Data path: Rule 3 (CQ before verbs) | FLOW-001, FLOW-002 | 5 | **Done** (mock-validated) |
+| §14.5 | Data path: Rule 4 (closed-loop buffers) | FLOW-001, FLOW-002 | 5 | **Done** (mock-validated) |
+| §14.5 | Data path: Rule 5 (test with real verbs) | VERIFY-001 | 5 | **Pending** (SoftRoCE/real-verbs run not yet performed) |
 | App. A | Config: all fields wired | CONFORM-005 | 9 | Pending |
 
 ### Traceability Statistics
 
+*(Recounted 2026-06-22 from the matrix rows above; the previous "43 total" figure
+was a miscount — there are 45 tracked rows.)*
+
 | Status | Count | Percentage |
 |--------|-------|------------|
-| **Done** (Phase 1-4 + manual fixes) | 10 | 23% |
-| **Pending** (Phase 5-9) | 31 | 72% |
-| **N/A** (context/analysis only) | 2 | 5% |
-| **Total design points** | 43 | 100% |
+| **Done** (Phases 1-6) | 32 | 71% |
+| **Pending** (Phases 7-9 + real-verbs validation) | 11 | 24% |
+| **N/A** (context/analysis only) | 2 | 4% |
+| **Total design points** | 45 | 100% |
+
+> **Validation caveat:** Phase 5 (wire format, buffer pools, send/recv data paths)
+> and Phase 6 (aggregation, event/smart CQ, NUMA) are marked Done on the basis of
+> mock-mode unit/integration tests passing. No SoftRoCE or real-RDMA run has yet
+> exercised the data path (§14.5 Rule 5 remains Pending), so these are
+> "implemented + mock-validated," not "hardware-proven."
 
 ### Coverage by Phase
 
-| Phase | Design Points Covered | Key Features |
-|-------|----------------------|--------------|
-| 1-4 (done) | 10 | Hot-path C, CGo wrappers, CQ busy-poll, off-heap alloc, connection lifecycle |
-| 5 | 12 | Wire format, buffer pools, send/recv data paths, 5 RDMA rules |
-| 6 | 7 | Aggregation, event/smart CQ, NUMA |
-| 7 | 4 | RDMA READ, large buffers |
-| 8 | 3 | Heartbeat, buffer monitor, CQ resize |
-| 9 | 5 | Full composition, performance targets, config wiring, final audit |
+| Phase | Design Points Covered | Status | Key Features |
+|-------|----------------------|--------|--------------|
+| 1-4 | 10 | Done | Hot-path C, CGo wrappers, CQ busy-poll, off-heap alloc, connection lifecycle |
+| 5 | 13 | Done (mock) | Wire format, buffer pools, send/recv data paths, RDMA rules 1-4 |
+| 6 | 9 | Done (mock) | Aggregation (3 triggers + busy flag), event/smart/user CQ modes, NUMA |
+| 7 | 3 | Pending | RDMA READ protocol, large buffers, HOL prevention |
+| 8 | 3 | Pending | Heartbeat, buffer monitor, dynamic CQ resize |
+| 9 | 5 | Pending | Full composition, performance targets, config wiring, final audit, real-verbs validation |
 
 ---
 
