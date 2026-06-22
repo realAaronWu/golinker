@@ -1,0 +1,79 @@
+name: integration-rxe
+
+# Runs the golinker test suite on Linux. The `mock` job is hardware-free and
+# gates every push. The `rxe-integration` job stands up SoftRoCE (the rdma_rxe
+# kernel module), builds the real-verbs (CGo) path for the first time, and runs
+# VERIFY-001 — the real end-to-end data-path smoke test (design.md §14.5 Rule 5).
+
+on:
+  push:
+    branches: [main, "feature-**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  mock:
+    name: mock unit + integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build (mock)
+        run: go build -tags mock ./...
+      - name: Vet (mock)
+        run: go vet -tags mock ./...
+      - name: Test (mock, race)
+        run: go test -tags mock -race -count=1 ./...
+
+  rxe-integration:
+    name: real-verbs smoke test over SoftRoCE
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install RDMA userspace (rdma-core + dev headers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            rdma-core ibverbs-providers ibverbs-utils \
+            libibverbs-dev librdmacm-dev libnuma-dev
+
+      - name: Load rdma_rxe and create SoftRoCE device
+        run: |
+          set -euxo pipefail
+          # The rxe module ships in linux-modules-extra on Azure-hosted runners.
+          sudo modprobe rdma_rxe \
+            || (sudo apt-get install -y "linux-modules-extra-$(uname -r)" \
+                && sudo modprobe rdma_rxe)
+
+          # Bind rxe to the default-route interface and publish its IPv4.
+          DEV="$(ip -o -4 route show to default | awk '{print $5}' | head -1)"
+          IP="$(ip -o -4 addr show dev "$DEV" | awk '{print $4}' | cut -d/ -f1 | head -1)"
+          sudo rdma link add rxe0 type rxe netdev "$DEV"
+
+          echo "GOLINKER_RXE_IP=${IP}" >> "$GITHUB_ENV"
+
+          # Diagnostics — fail early if the device didn't come up.
+          rdma link
+          ibv_devices
+          ibv_devinfo -d rxe0
+
+      - name: Build real-verbs path (CGo, first real compile)
+        env:
+          CGO_ENABLED: "1"
+        run: go build ./...
+
+      - name: Vet real-verbs path
+        env:
+          CGO_ENABLED: "1"
+        run: go vet ./internal/... ./pkg/...
+
+      - name: VERIFY-001 — end-to-end smoke test over rxe
+        env:
+          CGO_ENABLED: "1"
+        run: go test -tags integration -v -count=1 -timeout 120s ./test/integration/
